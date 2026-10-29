@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>sigkit viewer — design spec</title>
+<style>
+  body { font: 15px/1.5 -apple-system, "Inter", system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1, h2, h3 { line-height: 1.2; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 0.3rem 0.5rem; vertical-align: top; text-align: left; }
+  pre { background: #f5f5f5; padding: 0.75rem; overflow-x: auto; }
+  code { font-size: 0.92em; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #e6e6e6; } th, td { border-color: #444; } pre { background: #1c1c1c; } }
+</style>
+</head>
+<body>
+
+<h1>sigkit viewer — design spec</h1>
+<p>2026-10-29. Status: accepted after a grilling session. Vocabulary: <code>GLOSSARY.md</code>. Tickets: <code>.scratch/viewer/issues/</code>.</p>
+
+<h2>Problem Statement</h2>
+<p>I record raw sensor signals from phones (an Android and an iPhone to start) and I have old raw files from past work. I need to look at them honestly: many channels at different rates, on different clocks, in files that run for an hour at hundreds of hertz, with dropped samples and clocks that drift against each other.</p>
+<p>Every viewer I have used for this was either self-written and crashed or crawled on long files, or a general plotting tool that averages samples away on zoom-out, hides gaps, puts grid lines on values like 0.34245, and has no way to stretch one signal against another to see whether two clocks agree. Aligning two devices' recordings today means scripting, and the result is never persisted next to the data.</p>
+
+<h2>Solution</h2>
+<p><strong>sigkit-viewer</strong> is a desktop app that opens recordings as they are and shows the truth at every zoom: min/max candles instead of averages, gaps as gaps, and a residual channel that makes jitter, dropped samples and clock drift visible as shapes. Signals are manipulated directly on the plot: drag to shift, stretch to correct a rate, drag across to offset, stretch across to scale. The corrections and calibrations are saved into the recording's header automatically, never into the raw bytes. Two recordings open side by side in one coordinate system. There is no file-size limit. Legacy raw files are imported through a sheet with a live preview. A fixed-rate export writes a clean, uniformly sampled recording for downstream tools such as the filter.</p>
+<p>The feel is scientific inside and iPhone outside: the plot is the app, gestures first, everything animated, nothing modal, nothing hidden.</p>
+
+<h2>User Stories</h2>
+<ol>
+  <li>As a signal analyst, I want to open a <code>.sigrec</code> recording by double-click, drag-and-drop or command line, so that looking at data costs nothing.</li>
+  <li>As a signal analyst, I want every channel drawn as min/max candles when a pixel covers many samples, so that spikes and dropouts are never averaged away.</li>
+  <li>As a signal analyst, I want to open an hour of 500 Hz data on thirty channels and pan and zoom at 60 fps, so that long recordings are as usable as short ones.</li>
+  <li>As a signal analyst, I want recordings larger than my RAM to open and page in as I scroll, so that there is no size at which the tool gives up.</li>
+  <li>As a signal analyst, I want the second open of a recording to be instant, so that re-opening is not punished with a rebuild.</li>
+  <li>As a signal analyst, I want grid lines only at 1-2-5 multiples on both axes, with the time axis switching between ms, s and min on its own, so that I can read values off the grid.</li>
+  <li>As a signal analyst, I want time to run vertically by default with channels side by side, so that many parallel channels fit on one screen, and I want to switch to horizontal with one button.</li>
+  <li>As a signal analyst, I want pinch to zoom time around the cursor and Shift+pinch to zoom values, so that zooming is a gesture and not a toolbar trip.</li>
+  <li>As a signal analyst, I want two-finger scroll to pan both axes with inertia, so that moving through a recording feels physical.</li>
+  <li>As a signal analyst, I want double-click on the plot to autoscale values to the visible window, double-click on a channel's legend to autoscale to the whole signal, and a Box mode to autoscale to a rectangle I draw, so that I never adjust an axis by hand.</li>
+  <li>As a signal analyst, I want zoom and autoscale to animate briefly, so that I keep my bearings when the view changes.</li>
+  <li>As a signal analyst, I want each panel to have one value axis, and channels dropped on the same panel to share it, so that overlaid signals are compared in one coordinate system.</li>
+  <li>As a signal analyst, I want each channel in its own panel to keep its own view scale, so that a tiny signal next to a large one is still readable.</li>
+  <li>As a signal analyst, I want a sidebar tree of recordings, streams and channels, so that I can see what is in a file before plotting it.</li>
+  <li>As a signal analyst, I want to drag a channel from the tree onto a panel to overlay it, between panels to create a new one, and back to the tree to remove it, so that layout is direct manipulation.</li>
+  <li>As a signal analyst, I want to drop a second recording on the window and see it appear in the tree next to the first, so that comparing two devices starts with a gesture.</li>
+  <li>As a signal analyst, I want a cursor line through all panels showing each channel's nearest sample value and, for timestamped streams, that sample's stamp, so that I read real samples and not interpolations.</li>
+  <li>As a signal analyst, I want the time axis in seconds from the recording's zero, and the cursor to also show UTC when the recording has an anchor, so that I can relate a moment to the wall clock without the axis being cluttered.</li>
+  <li>As a signal analyst, I want to see a timestamped stream's residual against its nominal rate as a virtual channel under the stream, so that clock drift shows as a slope and dropped samples as steps.</li>
+  <li>As a signal analyst, I want the fitted rate shown as a number and in ppm from nominal, with a toggle that subtracts the fit from the residual, so that I can separate drift from jitter.</li>
+  <li>As a signal analyst, I want gaps in a timestamped stream to break the line at every zoom level, so that missing data is never drawn as a straight line.</li>
+  <li>As a signal analyst, I want an Align mode where I grab the active stream on the plot and drag it along time to shift it, so that aligning two recordings is a drag.</li>
+  <li>As a signal analyst, I want Shift+drag along time in Align to stretch the stream about the point under the cursor, so that I can correct a rate while watching two signals fall into phase.</li>
+  <li>As a signal analyst, I want drag across values to offset a channel and Shift+drag across to scale it about the cursor, so that level mismatches between sensors are fixed with the same gesture.</li>
+  <li>As a signal analyst, I want numeric fields for shift, k (also shown as corrected rate and ppm), gain and offset next to the plot, with arrow keys nudging by one pixel and Shift+arrow by ten, so that I can be precise after being fast.</li>
+  <li>As a signal analyst, I want Align to have no snapping, so that the tool never decides where my signal belongs.</li>
+  <li>As a signal analyst, I want every calibration and correction saved into the recording's header on each change, with Cmd+Z undo for the session, so that I never lose an alignment and never press Save.</li>
+  <li>As a signal analyst, I want the raw column bytes of a recording never to change, so that I can always get back to what the sensor said.</li>
+  <li>As a signal analyst, I want to save and reopen a workspace: which recordings are open, the panels, orientation, view ranges and mode, so that a comparison I set up survives a restart.</li>
+  <li>As a signal analyst, I want to drop a legacy raw file with no header on the window and get a sheet where I set dtype, byte order, header offset, channel count and rate while a preview re-renders on every change, so that importing old data takes seconds.</li>
+  <li>As a signal analyst, I want the import sheet to guess dtype by trying plausible decodings, so that the common case is confirm-and-go.</li>
+  <li>As a signal analyst, I want import to write a header beside the raw file without copying data, so that import is cheap and reversible.</li>
+  <li>As a signal analyst, I want an explicit export of a timestamped stream to a new fixed-rate recording, with the rate fitted by least squares and gaps written as NaN, so that downstream tools get uniform arrays and still see the holes.</li>
+  <li>As a signal analyst, I want the mode switch as a segment control at the bottom and the keys 1, 2, 3 as accelerators, so that modes are visible and fast.</li>
+  <li>As a signal analyst, I want the app to follow the system light/dark theme, use a clean sans-serif, thin antialiased lines and a muted grid, so that it looks like something I want to keep open.</li>
+  <li>As a signal analyst, I want no modal dialogs, no hidden gestures, no sounds and no onboarding, so that the tool stays out of my way.</li>
+  <li>As a developer of the toolkit, I want a command-line generator of synthetic recordings with known jitter, drops and ppm drift, so that every feature can be verified against a known truth before any phone logger exists.</li>
+  <li>As a developer of the toolkit, I want a command-line inspector that prints a recording's streams, channels, counts and fitted rates, so that I can check a file without opening the viewer.</li>
+  <li>As a developer of the toolkit, I want the recording format and the pyramid in a crate separate from the viewer, so that the logger and the filter reuse them.</li>
+</ol>
+
+<h2>Implementation Decisions</h2>
+
+<h3>Recording format (<code>.sigrec</code>)</h3>
+<ul>
+  <li>A recording is a directory named <code>&lt;name&gt;.sigrec</code> with <code>header.json</code> and one planar little-endian column file per channel. A timestamped stream adds one time column. Column files are named <code>&lt;stream&gt;.&lt;channel&gt;.bin</code> and <code>&lt;stream&gt;.t.bin</code>.</li>
+  <li>The unit of storage is the <strong>stream</strong>: channels sharing one time column (timestamped) or one rate (fixed-rate). A vector sensor is one stream; a single channel is a stream of one.</li>
+  <li>Allowed dtypes: <code>f32</code>, <code>f64</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>. Time columns are <code>i64</code> in the stream's clock domain unit.</li>
+  <li>Per stream: id, kind, clock domain and unit, nominal rate, rate (fixed-rate only), time correction <code>k</code> and <code>shift</code>, optional UTC anchor, channels, free-text notes. Per channel: id, dtype, unit, gain, offset.</li>
+  <li>Raw column bytes are never rewritten by the viewer. Only <code>header.json</code> is rewritten, atomically (write to a temp file, rename). Unknown header fields are preserved on rewrite.</li>
+  <li>Column lengths are validated on open: every column of a stream must hold the same number of samples. A mismatch is an error, not a silent truncation.</li>
+  <li>A <code>.cache/</code> directory inside the recording holds the pyramid levels. It is regenerable, versioned, and ignored by git.</li>
+  <li>The header reserves an <code>expressions</code> array for per-element expression channels (v2). Resampling is not an expression; it is the fixed-rate export.</li>
+  <li>MCAP is not the storage format. An MCAP export may come later.</li>
+</ul>
+<p>Header shape (decision-encoding, not a schema file):</p>
+<pre><code>{
+  "sigrec": 1,
+  "name": "pixel7-drive",
+  "created": "2026-10-29T12:00:00Z",
+  "source": { "device": "Pixel 7", "os": "Android 15", "app": "sigkit-logger 0.1" },
+  "streams": [
+    {
+      "id": "accel",
+      "kind": "timestamped",
+      "time": { "domain": "android.elapsedRealtimeNanos", "unit": "ns" },
+      "rate_nominal_hz": 416.0,
+      "time_correction": { "k": 1.0, "shift_s": 0.0 },
+      "utc_anchor": { "mono": 123456789012, "utc_ns": 1761739200000000000 },
+      "channels": [
+        { "id": "x", "dtype": "f32", "unit": "m/s^2", "gain": 1.0, "offset": 0.0 },
+        { "id": "y", "dtype": "f32", "unit": "m/s^2", "gain": 1.0, "offset": 0.0 },
+        { "id": "z", "dtype": "f32", "unit": "m/s^2", "gain": 1.0, "offset": 0.0 }
+      ],
+      "notes": ""
+    },
+    {
+      "id": "legacy",
+      "kind": "fixed_rate",
+      "rate_hz": 100.0,
+      "time_correction": { "k": 1.0, "shift_s": 0.0 },
+      "channels": [ { "id": "ch0", "dtype": "i16", "unit": "", "gain": 0.001, "offset": 0.0 } ]
+    }
+  ],
+  "expressions": []
+}</code></pre>
+
+<h3>Time</h3>
+<ul>
+  <li>The per-sample stamp is the truth; any rate is derived. Delivery rate and batching are irrelevant; only the sensor hub's stamps matter.</li>
+  <li>Clock domains are converted on read into seconds from the recording's zero. Stamps stay raw on disk.</li>
+  <li>Display time of a stream is <code>k · t + shift</code>, applied identically to timestamped and fixed-rate streams.</li>
+  <li>The axis shows seconds from the recording's zero with 1-2-5 ticks that switch between ms, s and min. Each recording has its own zero; shift aligns recordings. UTC appears only in the cursor readout, when the recording carries an anchor.</li>
+  <li>The fitted rate of a timestamped stream is the least-squares slope of stamp against index. The residual channel is <code>t_i − (i / f + t0)</code> with <code>f</code> = nominal rate by default and a toggle to use the fitted rate instead. The fitted rate is shown as a number and as ppm from nominal.</li>
+  <li>Automatic alignment of two devices by GPS time is out of scope for the viewer; the logger still records UTC anchor pairs because they cannot be recorded retroactively.</li>
+</ul>
+
+<h3>Rendering and memory</h3>
+<ul>
+  <li>Candle rendering: a pixel along time that covers many samples is drawn from the min and the max of those samples. Never an average.</li>
+  <li>The pyramid is built per channel on first open and cached. It is binned by time, not by index: the base bin is 64 nominal intervals; each level above merges two bins. Empty bins are gaps and break the line at every level. The pyramid costs about a quarter of a byte per sample.</li>
+  <li>Below the base level the widget reads raw samples for the viewport straight from the memory-mapped column. For a timestamped stream the viewport's sample range is found by binary search over the monotonic time column. The OS, not the app, decides which pages stay resident.</li>
+  <li>No file-size limit and no scratch files. A recording larger than RAM pages in on untouched regions.</li>
+  <li>The frame draws two vertices per pixel along time per channel plus raw points when zoomed in. No allocation in the frame loop.</li>
+  <li>Rendering goes through egui on the wgpu backend. The plot is a custom widget on the egui painter, not egui_plot.</li>
+</ul>
+
+<h3>Plot widget and orientation</h3>
+<ul>
+  <li>The widget lives in along-time and across-value coordinates, never x and y. Orientation is a workspace setting that maps them to the screen: vertical (time top to bottom, panels left to right) is the default; horizontal is one toggle away. Every gesture and Align operation is defined in the widget's own terms so switching orientation reassigns nothing.</li>
+  <li>Grid: 1-2-5 ticks on both axes. Time ticks adapt their unit.</li>
+  <li>Panels: one value axis per panel; channels on the same panel overlay in one coordinate system. A channel alone in a panel keeps its own view scale.</li>
+</ul>
+
+<h3>Interaction</h3>
+<ul>
+  <li>Modes: Pan (default), Align, Box. A segment control at the bottom; keys 1, 2, 3 are accelerators.</li>
+  <li>Pan: pinch zooms along time around the cursor; Shift+pinch zooms across value around the cursor; two-finger scroll pans both axes with inertia.</li>
+  <li>Autoscale: <code>A</code> fits the visible window, <code>Shift+A</code> fits the whole signal, double-click on the plot fits visible, double-click on a legend fits the whole signal, releasing a Box rectangle fits to it. Zoom and autoscale animate over about 150 ms with easing.</li>
+  <li>Align: click a legend to make a stream active, then drag it directly on the plot. Along time: drag = shift, Shift+drag = k anchored at the point under the cursor. Across value: drag = offset, Shift+drag = gain anchored at the cursor. Numeric fields for shift, k (shown also as corrected rate and ppm), gain and offset sit next to the plot. Arrow keys nudge by one pixel, Shift+arrow by ten. No snapping.</li>
+  <li>Cursor: a line through all panels showing each channel's nearest-sample value and, for timestamped streams, the sample's stamp. No interpolation in the readout.</li>
+  <li>Sidebar: a tree of recordings → streams → channels, with the residual as a virtual channel under each timestamped stream. Drag a channel onto a panel to overlay, between panels to create one, back to the tree to remove. Drop a second recording on the window to add it.</li>
+</ul>
+
+<h3>Persistence</h3>
+<ul>
+  <li>Header edits (calibration, corrections) autosave on every change. Undo (Cmd+Z) covers the session's header edits.</li>
+  <li>The workspace (<code>.sigws.json</code>) holds what belongs to no single recording: open recordings, panels and their channels, orientation, view ranges, mode. It is saved explicitly.</li>
+</ul>
+<pre><code>{
+  "sigws": 1,
+  "recordings": ["pixel7-drive.sigrec", "iphone-drive.sigrec"],
+  "orientation": "vertical",
+  "mode": "pan",
+  "view": { "time_from_s": 12.0, "time_to_s": 48.0 },
+  "panels": [
+    { "channels": [ { "recording": 0, "stream": "accel", "channel": "z" },
+                    { "recording": 1, "stream": "accel", "channel": "z" } ],
+      "value_from": -12.0, "value_to": 12.0 },
+    { "channels": [ { "recording": 0, "stream": "accel", "channel": "residual" } ] }
+  ]
+}</code></pre>
+
+<h3>Import of legacy raw files</h3>
+<ul>
+  <li>Dropping a file that is not a recording opens a sheet with: dtype, byte order, header offset in bytes, channel count for interleaved data, rate, gain and offset. The preview re-renders on every change.</li>
+  <li>The initial dtype is guessed by decoding a prefix as each plausible dtype and scoring plausibility (finite, bounded, not dominated by outliers).</li>
+  <li>Confirming writes a <code>header.json</code> beside the file as a fixed-rate stream; the data is not copied.</li>
+</ul>
+
+<h3>Fixed-rate export</h3>
+<ul>
+  <li>An explicit command on a timestamped stream. The target rate defaults to the fitted rate, editable in the export sheet.</li>
+  <li>Linear interpolation onto the uniform grid. A gap longer than two nominal intervals is written as <code>NaN</code>, not interpolated across.</li>
+  <li>The output is a new recording next to the source, with the residual exported beside it as a channel.</li>
+</ul>
+
+<h3>Look and feel</h3>
+<ul>
+  <li>Follows the system theme. Inter for text. Thin antialiased lines, muted grid, a fixed channel palette.</li>
+  <li>Anything needing input is a sheet or a sidebar with a live preview. No modal dialogs, no hidden gestures, no sounds, no onboarding.</li>
+</ul>
+
+<h3>Stack and repository</h3>
+<ul>
+  <li>Rust stable, egui with the wgpu backend, a custom plot widget. Cargo workspace: <code>sigkit-format</code> (format, pyramid, residual, resampling, rate fit, synthetic generator), <code>sigkit-viewer</code>, a <code>sigkit</code> CLI, later <code>sigkit-ekf</code>. Phone loggers under <code>loggers/</code>, specified separately.</li>
+  <li>The synthetic generator produces recordings with known truth: fixed-rate sine plus noise; timestamped with configurable jitter, dropped samples and ppm drift; a pair preset that writes two recordings of the same physical signal on two drifting clocks with a shift. Every viewer feature is verified against these before any phone logger exists.</li>
+</ul>
+
+<h2>Testing Decisions</h2>
+<ul>
+  <li>A good test exercises external behaviour at a seam and never implementation details. There is no CI and no coverage target.</li>
+  <li>Seams, all in <code>sigkit-format</code> and all pure functions over columns: read/write round-trip of a recording (including unknown header fields and length validation); pyramid building (a bin's min/max equals the brute-force min/max of the samples it covers, empty bins are marked); least-squares rate fit and residual (recover the ppm drift and the drop steps that the generator injected); resampling (gap → NaN, interpolation exact on a linear signal); dtype guessing on generator output.</li>
+  <li>The viewer UI is not unit-tested. It is verified by hand on generator recordings and, later, on real phone recordings. Each ticket's acceptance criteria say what to look at.</li>
+  <li>Prior art: none, this is a new repository. Tests are plain Rust <code>#[test]</code> functions and integration tests under <code>tests/</code> using a temporary directory.</li>
+</ul>
+
+<h2>Out of Scope</h2>
+<ul>
+  <li>Live streaming from a phone (the format is append-friendly for it; later).</li>
+  <li>Automatic alignment of two recordings by GPS time.</li>
+  <li>Expression channels (schema slot reserved).</li>
+  <li>Map view, FFT, Allan variance, MCAP export.</li>
+  <li>Snapping in Align, onboarding, tooltips, sounds.</li>
+  <li>Packaging and polish for Windows and Linux. The code is portable; only macOS is verified.</li>
+  <li>The phone loggers and the filter. They get their own specs.</li>
+</ul>
+
+<h2>Further Notes</h2>
+<ul>
+  <li>The Rust toolchain is not installed on the development Mac at the time of writing. Install via rustup before ticket 01.</li>
+  <li>The glossary is the vocabulary for tickets, code identifiers and UI labels. New terms go there first.</li>
+  <li>Memory is bounded by the pyramid and the resident pages the viewport touched; there is deliberately no cap and no scratch-file layer.</li>
+</ul>
+
+</body>
+</html>

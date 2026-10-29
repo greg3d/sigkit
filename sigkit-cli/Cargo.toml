@@ -1,0 +1,19 @@
+[package]
+name = "sigkit-cli"
+description = "sigkit command line: generate synthetic recordings and inspect recordings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sigkit"
+path = "src/main.rs"
+
+[dependencies]
+sigkit-format = { path = "../sigkit-format" }
+clap.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

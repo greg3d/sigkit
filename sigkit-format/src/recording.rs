@@ -1,0 +1,354 @@
+//! A recording on disk: a `.sigrec` directory with `header.json` and planar columns.
+
+use crate::atomic::write_atomic;
+use crate::column::{Column, Dtype, time_from_le_bytes, time_to_le_bytes};
+use crate::error::{Error, Result};
+use crate::header::{Header, Stream, StreamKind, TIME_COLUMN};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const HEADER_FILE: &str = "header.json";
+
+/// A stream's samples: the time column (timestamped streams only) and one
+/// column per channel, in header order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamData {
+    pub time: Option<Vec<i64>>,
+    pub channels: Vec<Column>,
+}
+
+impl StreamData {
+    pub fn timestamped(time: Vec<i64>, channels: Vec<Column>) -> StreamData {
+        StreamData {
+            time: Some(time),
+            channels,
+        }
+    }
+
+    pub fn fixed_rate(channels: Vec<Column>) -> StreamData {
+        StreamData {
+            time: None,
+            channels,
+        }
+    }
+}
+
+/// An open recording. Opening validates the header and every column length;
+/// the raw column bytes are never rewritten through this type.
+#[derive(Debug)]
+pub struct Recording {
+    dir: PathBuf,
+    header: Header,
+    sample_counts: HashMap<String, usize>,
+}
+
+impl Recording {
+    /// Open an existing recording directory, validating the header and that
+    /// every column of a stream holds the same number of samples.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Recording> {
+        let dir = dir.as_ref().to_path_buf();
+        let header_path = dir.join(HEADER_FILE);
+        let bytes = fs::read(&header_path).map_err(|source| Error::Io {
+            path: header_path.clone(),
+            source,
+        })?;
+        let header: Header = serde_json::from_slice(&bytes).map_err(|source| Error::Json {
+            path: header_path,
+            source,
+        })?;
+        header.validate()?;
+        let sample_counts = header
+            .streams
+            .iter()
+            .map(|stream| Ok((stream.id.clone(), validate_stream_columns(&dir, stream)?)))
+            .collect::<Result<_>>()?;
+        Ok(Recording {
+            dir,
+            header,
+            sample_counts,
+        })
+    }
+
+    /// Write a new recording: the directory, one column file per channel
+    /// (and the time column of each timestamped stream), then the header.
+    /// `streams` are in header order. Refuses a directory that already holds
+    /// a header, and data whose shape disagrees with the header; in both
+    /// cases nothing is written.
+    pub fn create(
+        dir: impl AsRef<Path>,
+        header: Header,
+        streams: &[StreamData],
+    ) -> Result<Recording> {
+        let dir = dir.as_ref().to_path_buf();
+        let header_path = dir.join(HEADER_FILE);
+        if header_path.exists() {
+            return Err(Error::AlreadyExists { path: header_path });
+        }
+        header.validate()?;
+        if streams.len() != header.streams.len() {
+            return Err(Error::StreamCountMismatch {
+                header: header.streams.len(),
+                given: streams.len(),
+            });
+        }
+        let sample_counts = header
+            .streams
+            .iter()
+            .zip(streams)
+            .map(|(stream, data)| Ok((stream.id.clone(), check_stream_data(stream, data)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        fs::create_dir_all(&dir).map_err(|source| Error::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        for (stream, data) in header.streams.iter().zip(streams) {
+            if let Some(time) = &data.time {
+                write_file(&dir.join(stream.time_file_name()), &time_to_le_bytes(time))?;
+            }
+            for (channel, column) in stream.channels.iter().zip(&data.channels) {
+                write_file(
+                    &dir.join(stream.channel_file_name(channel)),
+                    &column.to_le_bytes(),
+                )?;
+            }
+        }
+        let recording = Recording {
+            dir,
+            header,
+            sample_counts,
+        };
+        recording.write_header()?;
+        Ok(recording)
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// Edit header facts (calibration, corrections, notes). Persist with
+    /// [`Recording::write_header`]. Column facts (channel lists, dtypes) are
+    /// validated only at open.
+    pub fn header_mut(&mut self) -> &mut Header {
+        &mut self.header
+    }
+
+    /// Rewrite `header.json` atomically: a temp file beside it, fsync, rename.
+    /// An interrupted write leaves the old header intact.
+    pub fn write_header(&self) -> Result<()> {
+        let path = self.dir.join(HEADER_FILE);
+        let mut bytes = serde_json::to_vec_pretty(&self.header).map_err(|source| Error::Json {
+            path: path.clone(),
+            source,
+        })?;
+        bytes.push(b'\n');
+        write_atomic(&path, &bytes).map_err(|source| Error::Io { path, source })
+    }
+
+    /// Samples per stream, as validated at open.
+    pub fn sample_count(&self, stream_id: &str) -> Option<usize> {
+        self.sample_counts.get(stream_id).copied()
+    }
+
+    /// Read a stream's time column; `None` for a fixed-rate stream.
+    pub fn read_time(&self, stream_id: &str) -> Result<Option<Vec<i64>>> {
+        let stream = self.stream(stream_id)?;
+        self.read_time_of(stream)
+    }
+
+    /// Read a whole stream into memory.
+    pub fn read_stream(&self, stream_id: &str) -> Result<StreamData> {
+        let stream = self.stream(stream_id)?;
+        let time = self.read_time_of(stream)?;
+        let channels = stream
+            .channels
+            .iter()
+            .map(|channel| {
+                let path = self.dir.join(stream.channel_file_name(channel));
+                let bytes = read_file(&path)?;
+                Column::from_le_bytes(channel.dtype, &bytes).ok_or_else(|| {
+                    column_size_error(
+                        stream,
+                        &channel.id,
+                        channel.dtype,
+                        &path,
+                        bytes.len() as u64,
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(StreamData { time, channels })
+    }
+
+    fn stream(&self, stream_id: &str) -> Result<&Stream> {
+        self.header
+            .stream(stream_id)
+            .ok_or_else(|| Error::InvalidStream {
+                stream: stream_id.to_string(),
+                reason: "no such stream".into(),
+            })
+    }
+
+    fn read_time_of(&self, stream: &Stream) -> Result<Option<Vec<i64>>> {
+        match stream.kind {
+            StreamKind::Timestamped => {
+                let path = self.dir.join(stream.time_file_name());
+                let bytes = read_file(&path)?;
+                Ok(Some(time_from_le_bytes(&bytes).ok_or_else(|| {
+                    column_size_error(stream, TIME_COLUMN, Dtype::I64, &path, bytes.len() as u64)
+                })?))
+            }
+            StreamKind::FixedRate => Ok(None),
+        }
+    }
+}
+
+fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Check that `data` has the shape the header promises for `stream`: a time
+/// column exactly when the stream is timestamped, one column per channel with
+/// its dtype, and every column the same length. Returns that length.
+fn check_stream_data(stream: &Stream, data: &StreamData) -> Result<usize> {
+    let invalid = |reason: String| Error::InvalidStream {
+        stream: stream.id.clone(),
+        reason,
+    };
+    match (stream.kind, &data.time) {
+        (StreamKind::Timestamped, None) => {
+            return Err(invalid("timestamped stream needs a time column".into()));
+        }
+        (StreamKind::FixedRate, Some(_)) => {
+            return Err(invalid(
+                "fixed-rate stream must not have a time column".into(),
+            ));
+        }
+        _ => {}
+    }
+    if data.channels.len() != stream.channels.len() {
+        return Err(invalid(format!(
+            "header lists {} channels but {} columns were given",
+            stream.channels.len(),
+            data.channels.len()
+        )));
+    }
+    let mut lengths: Vec<(String, usize)> = Vec::with_capacity(stream.channels.len() + 1);
+    if let Some(time) = &data.time {
+        lengths.push((TIME_COLUMN.to_string(), time.len()));
+    }
+    for (channel, column) in stream.channels.iter().zip(&data.channels) {
+        if column.dtype() != channel.dtype {
+            return Err(invalid(format!(
+                "channel `{}` is {} in the header but the column is {}",
+                channel.id,
+                channel.dtype,
+                column.dtype()
+            )));
+        }
+        lengths.push((channel.id.clone(), column.len()));
+    }
+    same_length(stream, &lengths)
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn column_size_error(
+    stream: &Stream,
+    column: &str,
+    dtype: Dtype,
+    path: &Path,
+    bytes: u64,
+) -> Error {
+    Error::ColumnSize {
+        stream: stream.id.clone(),
+        column: column.to_string(),
+        bytes,
+        dtype: dtype.name(),
+        path: path.to_path_buf(),
+    }
+}
+
+/// Check that every column file of `stream` exists, has a whole number of
+/// elements, and that all of them hold the same number of samples. Returns
+/// that number.
+fn validate_stream_columns(dir: &Path, stream: &Stream) -> Result<usize> {
+    let mut lengths: Vec<(String, usize)> = Vec::with_capacity(stream.channels.len() + 1);
+    if stream.kind == StreamKind::Timestamped {
+        let file = stream.time_file_name();
+        lengths.push((
+            TIME_COLUMN.to_string(),
+            column_length(dir, stream, TIME_COLUMN, &file, Dtype::I64)?,
+        ));
+    }
+    for channel in &stream.channels {
+        let file = stream.channel_file_name(channel);
+        lengths.push((
+            channel.id.clone(),
+            column_length(dir, stream, &channel.id, &file, channel.dtype)?,
+        ));
+    }
+    same_length(stream, &lengths)
+}
+
+/// All columns of a stream must hold the same number of samples. Returns it.
+fn same_length(stream: &Stream, lengths: &[(String, usize)]) -> Result<usize> {
+    let Some(&(_, first)) = lengths.first() else {
+        return Ok(0);
+    };
+    if lengths.iter().any(|(_, n)| *n != first) {
+        let detail = lengths
+            .iter()
+            .map(|(id, n)| format!("{id}: {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::ColumnLengthMismatch {
+            stream: stream.id.clone(),
+            detail,
+        });
+    }
+    Ok(first)
+}
+
+fn column_length(
+    dir: &Path,
+    stream: &Stream,
+    column: &str,
+    file: &str,
+    dtype: Dtype,
+) -> Result<usize> {
+    let elem_size = dtype.size() as u64;
+    let path = dir.join(file);
+    let meta = fs::metadata(&path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Error::MissingColumn {
+                stream: stream.id.clone(),
+                column: column.to_string(),
+                path: path.clone(),
+            }
+        } else {
+            Error::Io {
+                path: path.clone(),
+                source,
+            }
+        }
+    })?;
+    let bytes = meta.len();
+    if bytes % elem_size != 0 {
+        return Err(column_size_error(stream, column, dtype, &path, bytes));
+    }
+    Ok((bytes / elem_size) as usize)
+}

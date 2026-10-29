@@ -4,12 +4,20 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Cargo workspace with `sigkit-format` and a `sigkit` CLI builds on stable Rust
-- [ ] `sigkit gen` writes the three presets (fixed-rate, timestamped, pair) with the jitter, drop and ppm parameters it was given
-- [ ] `sigkit inspect` on a generated recording prints every stream and channel with counts, duration, nominal and fitted rate, and the fitted rate recovers the injected ppm drift within the noise the generator adds
-- [ ] A read → write → read round-trip test reproduces the header exactly, including a field the crate does not know
-- [ ] A recording whose columns disagree in length fails to open with an error naming the stream
-- [ ] Header rewrite goes through a temp file and rename, so an interrupted write leaves the old header intact
-- [ ] Clock domains, nominal rate, time correction, calibration and UTC anchor survive the round-trip
+- [x] Cargo workspace with `sigkit-format` and a `sigkit` CLI builds on stable Rust
+- [x] `sigkit gen` writes the three presets (fixed-rate, timestamped, pair) with the jitter, drop and ppm parameters it was given
+- [x] `sigkit inspect` on a generated recording prints every stream and channel with counts, duration, nominal and fitted rate, and the fitted rate recovers the injected ppm drift within the noise the generator adds
+- [x] A read → write → read round-trip test reproduces the header exactly, including a field the crate does not know
+- [x] A recording whose columns disagree in length fails to open with an error naming the stream
+- [x] Header rewrite goes through a temp file and rename, so an interrupted write leaves the old header intact
+- [x] Clock domains, nominal rate, time correction, calibration and UTC anchor survive the round-trip
+
+## Comments
+
+2026-10-29 — Implemented in `sigkit-format` and `sigkit-cli`. Seams tested (per the spec's Testing Decisions): read → write → read round-trip with unknown fields at every level (`tests/roundtrip.rs`), column length validation and id rules (`tests/validation.rs`), atomic header rewrite (`tests/atomic_header.rs`), rate fit against generator truth with and without dropped samples (`tests/ratefit.rs`), and the `sigkit` binary end to end (`sigkit-cli/tests/cli.rs`).
+
+Decision taken during review: the spec's Time section describes the fitted rate as "the least-squares slope of stamp against index". Taken literally, every dropped sample shifts all later stamps by one interval, so one drop in a thousand already reads as a thousand ppm and the acceptance criterion ("recovers the injected ppm drift") could only hold with `--drop 0`. The fit therefore runs against a gap-aware index (consecutive stamps about two nominal intervals apart count as two steps). Drift and jitter are far below an interval, so the rounding is unambiguous; the fit also yields the number of missing samples, which `inspect` prints. The residual channel (ticket 04) keeps the glossary's definition `t_i − (i / f + t0)` over the raw index, so drops still show as steps there. GLOSSARY updated (Fitted rate, Nominal rate, Preset, Truth, id rules).
+
+Known-field normalisation: a rewrite always writes `time_correction`, `notes`, `expressions` and a channel's `unit`/`gain`/`offset`, filling defaults for ones the header left out. Unknown fields pass through untouched at every level.

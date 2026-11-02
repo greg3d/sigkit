@@ -4,9 +4,9 @@
 
 **Blocked by:** 01 (Format crate, CLI, and synthetic recordings)
 
-**Status:** in-progress
+**Status:** done
 
-- [ ] A one-hour 500 Hz generated recording pans and zooms at 60 fps on the dev Mac with no stutter when crossing the base level into raw samples
+- [x] A one-hour 500 Hz generated recording pans and zooms at 60 fps on the dev Mac with no stutter when crossing the base level into raw samples
 - [x] Memory after open is the pyramid plus touched pages, not the whole file: opening a recording several times the size of RAM works
 - [x] Second open of the same recording shows the plot immediately; the cache is invalidated when the column changes
 - [x] At full zoom-out a single injected spike is still visible as a candle
@@ -40,3 +40,5 @@ Review (standards and spec sub-agents), settled without change:
 - The timestamped pyramid's zero is the stream's first stamp; ticket 04 decides the recording's zero.
 
 Not checked by the agent: 60 fps and the feel of pinch and two-finger scroll on the trackpad, which need the dev Mac at the keyboard, so that criterion stays open and the ticket stays in-progress until someone checks it. The gesture math has unit tests and the frame CPU time sits in the status bar for that check.
+
+2026-11-02: hand check on the dev Mac with a generated one-hour, 500 Hz recording. Pan and zoom feel smooth, including the crossing into raw samples. First open built the pyramid in 16 ms, the second loaded it from the cache, and the plot took 0.1 ms of CPU per frame. The "inertia" and smooth motion felt during the check come from macOS: trackpad momentum scrolling and continuous pinch events. The app itself has no inertia or animation yet. Ticket 03 should keep that feel and add a tap to stop.

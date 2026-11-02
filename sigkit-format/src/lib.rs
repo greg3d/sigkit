@@ -9,6 +9,8 @@ mod atomic;
 pub mod column;
 pub mod error;
 pub mod header;
+pub mod mapped;
+pub mod pyramid;
 pub mod ratefit;
 pub mod recording;
 pub mod synth;
@@ -19,5 +21,7 @@ pub use error::{Error, Result};
 pub use header::{
     Channel, ClockDomain, Header, Stream, StreamKind, TIME_COLUMN, TimeCorrection, UtcAnchor,
 };
+pub use mapped::MappedColumn;
+pub use pyramid::{BASE_BIN_INTERVALS, Bin, Fingerprint, Pyramid};
 pub use ratefit::{RateFit, fit_rate, ppm_from_nominal};
-pub use recording::{Recording, StreamData};
+pub use recording::{PyramidSource, Recording, StreamData};

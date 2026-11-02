@@ -34,6 +34,32 @@ impl Dtype {
     }
 }
 
+impl Dtype {
+    /// Decode one little-endian element, widened to `f64`. `bytes` is exactly
+    /// [`Dtype::size`] long.
+    pub fn decode_le(self, bytes: &[u8]) -> f64 {
+        match self {
+            Dtype::F32 => f32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            Dtype::F64 => f64::from_le_bytes(bytes.try_into().unwrap()),
+            Dtype::I16 => i16::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            Dtype::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            Dtype::I64 => i64::from_le_bytes(bytes.try_into().unwrap()) as f64,
+        }
+    }
+
+    /// Decode one little-endian element as an integer: exact for integer
+    /// dtypes, truncated for floats. `bytes` is exactly [`Dtype::size`] long.
+    pub fn decode_le_i64(self, bytes: &[u8]) -> i64 {
+        match self {
+            Dtype::F32 => f32::from_le_bytes(bytes.try_into().unwrap()) as i64,
+            Dtype::F64 => f64::from_le_bytes(bytes.try_into().unwrap()) as i64,
+            Dtype::I16 => i16::from_le_bytes(bytes.try_into().unwrap()) as i64,
+            Dtype::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as i64,
+            Dtype::I64 => i64::from_le_bytes(bytes.try_into().unwrap()),
+        }
+    }
+}
+
 impl std::fmt::Display for Dtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
@@ -102,14 +128,11 @@ impl Column {
 
     /// Decode on-disk bytes. `None` when the length is not a multiple of the dtype size.
     pub fn from_le_bytes(dtype: Dtype, bytes: &[u8]) -> Option<Column> {
-        if bytes.len() % dtype.size() != 0 {
+        if !bytes.len().is_multiple_of(dtype.size()) {
             return None;
         }
         fn unpack<T, const N: usize>(bytes: &[u8], f: impl Fn([u8; N]) -> T) -> Vec<T> {
-            bytes
-                .chunks_exact(N)
-                .map(|c| f(c.try_into().unwrap()))
-                .collect()
+            bytes.as_chunks::<N>().0.iter().map(|c| f(*c)).collect()
         }
         Some(match dtype {
             Dtype::F32 => Column::F32(unpack(bytes, f32::from_le_bytes)),

@@ -163,6 +163,12 @@ impl Stream {
         self.time.as_ref()?.seconds_per_tick()
     }
 
+    /// Ticks of the time column per second; `None` for a fixed-rate stream or
+    /// a clock unit this crate does not know.
+    pub fn ticks_per_second(&self) -> Option<f64> {
+        self.time.as_ref()?.ticks_per_second()
+    }
+
     /// File name of a channel column: `<stream>.<channel>.bin`.
     pub fn channel_file_name(&self, channel: &Channel) -> String {
         format!("{}.{}.bin", self.id, channel.id)
@@ -251,10 +257,16 @@ impl ClockDomain {
 
     /// Seconds per tick of the time column, or `None` for a unit this crate does not know.
     pub fn seconds_per_tick(&self) -> Option<f64> {
+        self.ticks_per_second().map(|t| 1.0 / t)
+    }
+
+    /// Ticks per second: exact in `f64`, so `ticks * rate / ticks_per_second`
+    /// stays exact where the true value is representable.
+    pub fn ticks_per_second(&self) -> Option<f64> {
         match self.unit.as_str() {
-            "ns" => Some(1e-9),
-            "us" => Some(1e-6),
-            "ms" => Some(1e-3),
+            "ns" => Some(1e9),
+            "us" => Some(1e6),
+            "ms" => Some(1e3),
             "s" => Some(1.0),
             _ => None,
         }

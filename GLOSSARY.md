@@ -16,8 +16,14 @@
 | **Residual** | The virtual channel `t_i − (i / f + t0)` of a timestamped stream. Jitter shows as noise, dropped samples as steps of `1/f`, clock drift as a slope (against nominal) that vanishes when the fit is subtracted. |
 | **Time correction** | Per-stream `k` and `shift`: display time is `k · t + shift`. The tool that stretches and moves a signal against another. Persisted in the header. |
 | **Calibration** | Per-channel `gain` and `offset`: display value is `gain · raw + offset`. Persisted in the header. |
-| **Pyramid** | The min/max decimation levels built per channel at open time and cached inside the recording. Binned by time; base bin is 64 nominal intervals; each level above merges two bins. |
+| **Pyramid** | The min/max decimation levels built per channel at open time and cached inside the recording. Binned by time; base bin is 64 nominal intervals; each level above merges two bins. Bins hold `f32` min and max; a bin covering no sample is empty and stays a gap at every level. |
 | **Base bin** | The finest pyramid level. Below it the widget reads raw samples for the viewport straight from the memory-mapped column. |
+| **Cache** | `.cache/<stream>.<channel>.pyr` inside a recording: a pyramid plus the fingerprint of the columns it was built from (length and mtime of each, dtype, base bin). A fingerprint mismatch means rebuild. Regenerable, never committed. |
+| **Trace** | In code, one channel ready to draw: its mapped column, its pyramid, its rate and calibration. It answers, per frame, the min and max in each pixel along time. |
+| **View** | What the widget shows: a time span along and a value span across, in data units. Orientation does not change a view; the mapping onto the screen does. |
+| **Bin** | One cell of a pyramid level: the `f32` min and max of the samples it covers, or empty (a gap). The same type holds one pixel's candle. |
+| **Mapped column** | A column read through a read-only memory map, so the OS pages it in as the viewport touches it. Never written; a column truncated while mapped kills the process. |
+| **Mapping** | In code, a view laid onto a screen rectangle in one orientation: the one place that turns (time, value) into screen points and back. |
 | **Candle** | How a pixel column (or row) is drawn when it covers many samples: the min and the max of everything packed into it. Never an average. |
 | **Panel** | One plotting area with one value axis. Channels laid on the same panel are overlaid in one coordinate system. |
 | **Overlay** | Several channels on one panel, sharing its value axis. Level mismatches are fixed with gain, not with separate axes. |

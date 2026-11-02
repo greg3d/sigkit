@@ -1,0 +1,21 @@
+[package]
+name = "sigkit-viewer"
+description = "Desktop viewer for .sigrec recordings: candles at every zoom, gestures first"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sigkit-viewer"
+path = "src/main.rs"
+
+[dependencies]
+sigkit-format = { path = "../sigkit-format" }
+eframe.workspace = true
+egui.workspace = true
+clap.workspace = true
+png = "0.18"
+
+[dev-dependencies]
+tempfile.workspace = true

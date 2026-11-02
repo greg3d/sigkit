@@ -3,12 +3,26 @@
 use crate::atomic::write_atomic;
 use crate::column::{Column, Dtype, time_from_le_bytes, time_to_le_bytes};
 use crate::error::{Error, Result};
-use crate::header::{Header, Stream, StreamKind, TIME_COLUMN};
+use crate::header::{Channel, Header, Stream, StreamKind, TIME_COLUMN};
+use crate::mapped::MappedColumn;
+use crate::pyramid::{BASE_BIN_INTERVALS, Fingerprint, Pyramid};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 pub const HEADER_FILE: &str = "header.json";
+/// Regenerable, versioned derived data inside a recording: the pyramids.
+pub const CACHE_DIR: &str = ".cache";
+
+/// Where [`Recording::pyramid`] got its pyramid from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyramidSource {
+    /// Loaded from `.cache/`, so the open was instant.
+    Cache,
+    /// Built from the column (first open, or the column changed) and cached.
+    Built,
+}
 
 /// A stream's samples: the time column (timestamped streams only) and one
 /// column per channel, in header order.
@@ -185,6 +199,142 @@ impl Recording {
         Ok(StreamData { time, channels })
     }
 
+    /// Map a channel's column read-only. Pages are loaded as they are touched.
+    pub fn map_column(&self, stream_id: &str, channel_id: &str) -> Result<MappedColumn> {
+        let stream = self.stream(stream_id)?;
+        let channel = channel_of(stream, channel_id)?;
+        let path = self.dir.join(stream.channel_file_name(channel));
+        MappedColumn::open(&path, channel.dtype).map_err(|source| Error::Io { path, source })
+    }
+
+    /// Map a stream's time column read-only; `None` for a fixed-rate stream.
+    pub fn map_time(&self, stream_id: &str) -> Result<Option<MappedColumn>> {
+        let stream = self.stream(stream_id)?;
+        if stream.kind != StreamKind::Timestamped {
+            return Ok(None);
+        }
+        let path = self.dir.join(stream.time_file_name());
+        MappedColumn::open(&path, Dtype::I64)
+            .map(Some)
+            .map_err(|source| Error::Io { path, source })
+    }
+
+    /// The channel's pyramid: from `.cache/` when it matches the columns on
+    /// disk, otherwise built from the mapped column and cached. Writing the
+    /// cache is best effort, so a read-only recording still opens.
+    pub fn pyramid(&self, stream_id: &str, channel_id: &str) -> Result<(Pyramid, PyramidSource)> {
+        self.pyramid_with_progress(stream_id, channel_id, &mut |_, _| {})
+    }
+
+    /// [`Recording::pyramid`], reporting `(samples done, samples total)` now
+    /// and then while a pyramid is being built.
+    pub fn pyramid_with_progress(
+        &self,
+        stream_id: &str,
+        channel_id: &str,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<(Pyramid, PyramidSource)> {
+        let stream = self.stream(stream_id)?;
+        let channel = channel_of(stream, channel_id)?;
+        let rate = match stream.kind {
+            StreamKind::FixedRate => stream.rate_hz,
+            StreamKind::Timestamped => stream.rate_nominal_hz,
+        }
+        .expect("validated at open");
+        let base_bin_s = BASE_BIN_INTERVALS as f64 / rate;
+
+        let mut files = vec![file_stamp(
+            &self.dir.join(stream.channel_file_name(channel)),
+        )?];
+        if stream.kind == StreamKind::Timestamped {
+            files.push(file_stamp(&self.dir.join(stream.time_file_name()))?);
+        }
+        // Without a modification time a same-length rewrite would go
+        // unnoticed, so such a column is never served from the cache.
+        let files: Option<Vec<(u64, u128)>> = files.into_iter().collect();
+        let fingerprint = files.map(|files| Fingerprint {
+            files,
+            dtype: channel.dtype,
+            base_bin_s,
+        });
+        let cache_path = self
+            .dir
+            .join(CACHE_DIR)
+            .join(format!("{}.{}.pyr", stream.id, channel.id));
+        if let Some(fingerprint) = &fingerprint
+            && let Ok(bytes) = fs::read(&cache_path)
+            && let Some(pyramid) = Pyramid::from_cache_bytes(&bytes, fingerprint)
+        {
+            return Ok((pyramid, PyramidSource::Cache));
+        }
+
+        let column = self.map_column(stream_id, channel_id)?;
+        column.advise_sequential();
+        let n = column.len();
+        let mut report = |i: usize| {
+            if i.is_multiple_of(1 << 16) {
+                progress(i, n);
+            }
+        };
+        let value = |i: usize| column.get(i).expect("i < len");
+        let pyramid = match self.map_time(stream_id)? {
+            None => Pyramid::build_fixed_rate(rate, n, |i| {
+                report(i);
+                value(i)
+            }),
+            Some(time) => {
+                time.advise_sequential();
+                let ticks_per_second =
+                    stream
+                        .ticks_per_second()
+                        .ok_or_else(|| Error::InvalidStream {
+                            stream: stream.id.clone(),
+                            reason: "unknown clock unit, cannot bin by time".into(),
+                        })?;
+                let zero = time.get_i64(0).unwrap_or(0);
+                let interval = IntervalCounter::new(rate, ticks_per_second);
+                let bin_of = |i: usize| {
+                    let ticks = time.get_i64(i).expect("i < len").saturating_sub(zero);
+                    usize::try_from(interval.whole_intervals(ticks) / BASE_BIN_INTERVALS as i128)
+                        .unwrap_or(usize::MAX)
+                };
+                let bins = if n == 0 {
+                    0
+                } else {
+                    bin_of(n - 1).saturating_add(1)
+                };
+                // A healthy stream spans about n / 64 base bins; holes add
+                // empty ones. A last stamp that would need over a thousand
+                // times more bins than samples is corrupt, not a hole.
+                if bins > n.saturating_mul(1024).max(1 << 20) {
+                    return Err(Error::InvalidStream {
+                        stream: stream.id.clone(),
+                        reason: format!(
+                            "time column spans {bins} base bins for {n} samples; a stamp looks corrupt"
+                        ),
+                    });
+                }
+                Pyramid::build(
+                    base_bin_s,
+                    bins,
+                    (0..n).map(|i| {
+                        report(i);
+                        (bin_of(i), value(i))
+                    }),
+                )
+            }
+        };
+        progress(n, n);
+        column.advise_random();
+
+        if let Some(fingerprint) = &fingerprint
+            && fs::create_dir_all(self.dir.join(CACHE_DIR)).is_ok()
+        {
+            let _ = write_atomic(&cache_path, &pyramid.to_cache_bytes(fingerprint));
+        }
+        Ok((pyramid, PyramidSource::Built))
+    }
+
     fn stream(&self, stream_id: &str) -> Result<&Stream> {
         self.header
             .stream(stream_id)
@@ -204,6 +354,60 @@ impl Recording {
                 })?))
             }
             StreamKind::FixedRate => Ok(None),
+        }
+    }
+}
+
+fn channel_of<'a>(stream: &'a Stream, channel_id: &str) -> Result<&'a Channel> {
+    stream
+        .channel(channel_id)
+        .ok_or_else(|| Error::InvalidStream {
+            stream: stream.id.clone(),
+            reason: format!("no such channel `{channel_id}`"),
+        })
+}
+
+/// `(length, mtime in ns since the Unix epoch)` of a column file; `None`
+/// when the file system cannot report a modification time.
+fn file_stamp(path: &Path) -> Result<Option<(u64, u128)>> {
+    let meta = fs::metadata(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| (meta.len(), d.as_nanos())))
+}
+
+/// Counts whole nominal intervals in a span of clock ticks:
+/// `floor(ticks · rate / ticks_per_second)`. Exact in integers when the rate
+/// is a whole number of hertz (the usual case), so a stamp on a bin boundary
+/// lands in the bin that starts there however long the recording; otherwise
+/// in `f64`, exact while `ticks · rate` stays below 2^53.
+struct IntervalCounter {
+    rate: f64,
+    ticks_per_second: f64,
+    exact: Option<(i128, i128)>,
+}
+
+impl IntervalCounter {
+    fn new(rate: f64, ticks_per_second: f64) -> IntervalCounter {
+        let whole = |x: f64| (x.fract() == 0.0 && x > 0.0 && x < 1e15).then_some(x as i128);
+        IntervalCounter {
+            rate,
+            ticks_per_second,
+            exact: whole(rate).zip(whole(ticks_per_second)),
+        }
+    }
+
+    fn whole_intervals(&self, ticks: i64) -> i128 {
+        match self.exact {
+            Some((rate, tps)) => (ticks as i128 * rate).div_euclid(tps).max(0),
+            None => (ticks as f64 * self.rate / self.ticks_per_second)
+                .floor()
+                .max(0.0) as i128,
         }
     }
 }

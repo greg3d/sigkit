@@ -4,10 +4,10 @@
 
 **Blocked by:** 02 (Viewer opens a recording and draws one channel)
 
-**Status:** in-progress
+**Status:** done
 
 - [x] On a generated recording with 50 ppm drift the residual against nominal is a straight slope; with the fit subtracted it is flat noise of the injected jitter amplitude
-- [ ] Each dropped sample injected by the generator shows as a step of `1/f` in the residual and as a break in the signal line at every zoom
+- [x] Each dropped sample injected by the generator shows as a step of `1/f` in the residual and as a break in the signal line at every zoom
 - [x] The ppm readout matches the generator's drift within the fit's uncertainty
 - [x] A recording in `android.elapsedRealtimeNanos` and one in `ios.systemUptime` both display in seconds from their own zero
 - [x] A residual and rate-fit test recovers injected drift and drops from a generated time column
@@ -70,3 +70,5 @@ Open: "a break in the signal line at every zoom" is met only where the zoom can 
 `sigkit gen … --clock counter` writes such a recording (`sigkit.counter`, counting from 1 000 000).
 
 Zeros written in place of lost samples are left alone for now: without stamps they cannot be told from data, and no heuristic is wanted yet.
+
+2026-11-03: the user accepted the gap rule. A gap shows as a break wherever the zoom can resolve it, and seeing every gap is not essential. Finding gaps at any zoom becomes an optional tool, ticket 10 (detect time gaps). Caching the residual pyramids and the fit is a separate follow-up. Ticket done.

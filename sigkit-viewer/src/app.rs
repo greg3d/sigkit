@@ -1,11 +1,15 @@
 //! The application: the open recordings in a sidebar tree, their channels laid
 //! out on panels by dragging, and a bar at the bottom with the mode control,
-//! the cursor readout, the status line and the key hints. Pyramids are built
+//! the cursor readout, the status line and the key hints. In Align a sidebar
+//! on the right holds the active stream's corrections as fields; every
+//! change is written to the recording's header at once and `Cmd+Z` takes it
+//! back. Pyramids are built
 //! on a background thread so a first open of a huge recording shows progress
 //! instead of a frozen window.
 
+use crate::align::{Calibration, Change, Correction, Edit, History, stretch_factor};
 use crate::layout::{ChannelRef, Dragged, Drop, Layout};
-use crate::plot::{self, Mode, PlotState, Series, Shown};
+use crate::plot::{self, AlignDrag, Mode, PlotState, Series, Shown};
 use crate::trace::{Clock, Placement, Trace, Values};
 use crate::view::{Orientation, Span};
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
@@ -25,6 +29,8 @@ use std::time::{Duration, Instant};
 const RESIDUAL: &str = "residual";
 /// Width of the sidebar tree.
 const TREE_WIDTH: f32 = 260.0;
+/// Width of the Align sidebar.
+const ALIGN_WIDTH: f32 = 250.0;
 
 /// What the command line asked for.
 pub struct Options {
@@ -64,6 +70,38 @@ pub struct App {
     hover_time: Option<f64>,
     /// CPU time of the last plot frame, for checking the frame budget by eye.
     plot_ms: f64,
+    /// The session's header edits, for `Cmd+Z`.
+    history: History,
+    /// The Align drag in progress, from where it started.
+    drag: Option<DragStart>,
+    /// The Align field being typed into, and what is typed so far.
+    typing: Option<(Field, String)>,
+}
+
+/// Where an Align drag started: the active channel's corrections then, and
+/// the far ends a stretch pulls along.
+struct DragStart {
+    channel: ChannelRef,
+    correction: Correction,
+    /// `None` for a residual: it has no calibration in the header.
+    calibration: Option<Calibration>,
+    /// The display span end farther from the anchor.
+    far_time: f64,
+    /// The whole signal's extreme farther from the anchor.
+    far_value: Option<f64>,
+    /// What the drag has changed so far.
+    edit: Option<Edit>,
+}
+
+/// A number in the Align sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Shift,
+    K,
+    Ppm,
+    Rate,
+    Gain,
+    Offset,
 }
 
 /// A pending `--screenshot`: taken a few frames after the recordings are drawn.
@@ -91,10 +129,12 @@ struct Progress {
     total: AtomicUsize,
 }
 
-/// An open recording: every channel ready to draw.
+/// An open recording: every channel ready to draw, and its header, which
+/// Align edits.
 struct Loaded {
     path: PathBuf,
     name: String,
+    rec: Recording,
     entries: Vec<Entry>,
     /// Streams that could not be opened, said in the status bar.
     problems: Vec<String>,
@@ -124,6 +164,86 @@ struct Entry {
     subtract_fit: bool,
     /// The stream's rates, for a timestamped stream.
     rates: Option<Rates>,
+}
+
+impl Loaded {
+    /// The stream's time correction, as the header holds it.
+    fn correction(&self, stream: &str) -> Correction {
+        let tc = &self
+            .rec
+            .header()
+            .stream(stream)
+            .expect("loaded")
+            .time_correction;
+        Correction {
+            k: tc.k,
+            shift_s: tc.shift_s,
+        }
+    }
+
+    /// The channel's calibration, as the header holds it.
+    fn calibration(&self, stream: &str, channel: &str) -> Calibration {
+        let stream = self.rec.header().stream(stream).expect("loaded");
+        let channel = stream.channel(channel).expect("loaded");
+        Calibration {
+            gain: channel.gain,
+            offset: channel.offset,
+        }
+    }
+
+    /// Make `change` in the header and on every trace it moves: a time
+    /// correction moves each channel of the stream and its residual. Persist
+    /// with [`Loaded::save`].
+    fn set(&mut self, change: &Change) {
+        match change {
+            Change::Time { stream, to, .. } => {
+                let tc = &mut self
+                    .rec
+                    .header_mut()
+                    .stream_mut(stream)
+                    .expect("loaded")
+                    .time_correction;
+                tc.k = to.k;
+                tc.shift_s = to.shift_s;
+                for entry in self.entries.iter_mut().filter(|e| e.stream == *stream) {
+                    for trace in std::iter::once(&mut entry.trace).chain(&mut entry.fitted) {
+                        trace.set_placement(Placement {
+                            k: to.k,
+                            shift_s: to.shift_s,
+                            ..trace.placement()
+                        });
+                    }
+                }
+            }
+            Change::Calibration {
+                stream,
+                channel,
+                to,
+                ..
+            } => {
+                let header = self.rec.header_mut().stream_mut(stream).expect("loaded");
+                let c = header
+                    .channels
+                    .iter_mut()
+                    .find(|c| c.id == *channel)
+                    .expect("loaded");
+                c.gain = to.gain;
+                c.offset = to.offset;
+                for entry in &mut self.entries {
+                    if entry.stream == *stream && entry.channel == *channel && !entry.residual {
+                        entry.trace.set_calibration(to.gain, to.offset);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rewrite `header.json`; the columns are never touched.
+    fn save(&self) -> Result<(), String> {
+        self.rec
+            .write_header()
+            .map_err(|e| format!("{}: {e}", self.name))
+    }
 }
 
 impl Entry {
@@ -170,6 +290,9 @@ impl App {
             refit: Vec::new(),
             hover_time: None,
             plot_ms: 0.0,
+            history: History::default(),
+            drag: None,
+            typing: None,
         };
         app.plot.pinned_cursor = options.cursor;
         for path in options.recordings {
@@ -473,6 +596,289 @@ impl App {
         }
     }
 
+    /// Make `edit` on screen and write the header.
+    fn write(&mut self, edit: &Edit) {
+        let loaded = &mut self.recordings[edit.recording];
+        loaded.set(&edit.change);
+        if let Err(e) = loaded.save() {
+            self.report(e);
+        }
+    }
+
+    /// Make `edit`, write the header and remember it for `Cmd+Z`.
+    fn commit(&mut self, edit: Edit) {
+        if edit.changes_nothing() {
+            return;
+        }
+        self.write(&edit);
+        self.history.push(edit);
+    }
+
+    /// Take back the latest change, on screen and on disk. A drag in
+    /// progress is a change of its own: it ends here and is what is undone.
+    fn undo(&mut self) {
+        self.end_drag();
+        self.plot.let_go();
+        if let Some(edit) = self.history.undo() {
+            self.write(&edit);
+        }
+    }
+
+    /// The edit that sets the active channel's stream's time correction.
+    fn time_edit(&self, channel: ChannelRef, from: Correction, to: Correction) -> Edit {
+        Edit {
+            recording: channel.recording,
+            change: Change::Time {
+                stream: self.entry(channel).stream.clone(),
+                from,
+                to,
+            },
+        }
+    }
+
+    /// The edit that sets the channel's calibration.
+    fn calibration_edit(&self, channel: ChannelRef, from: Calibration, to: Calibration) -> Edit {
+        let entry = self.entry(channel);
+        Edit {
+            recording: channel.recording,
+            change: Change::Calibration {
+                stream: entry.stream.clone(),
+                channel: entry.channel.clone(),
+                from,
+                to,
+            },
+        }
+    }
+
+    /// The channel's stream's time correction and, unless it is a residual,
+    /// its calibration.
+    fn corrections(&self, channel: ChannelRef) -> (Correction, Option<Calibration>) {
+        let (loaded, entry) = (&self.recordings[channel.recording], self.entry(channel));
+        let calibration =
+            (!entry.residual).then(|| loaded.calibration(&entry.stream, &entry.channel));
+        (loaded.correction(&entry.stream), calibration)
+    }
+
+    /// Follow an Align drag of the active channel: move it live, and on
+    /// release write the header once and make the drag one undo step.
+    fn align_drag(&mut self, drag: AlignDrag) {
+        let Some(channel) = self.plot.active else {
+            return;
+        };
+        if drag.started || self.drag.as_ref().is_none_or(|d| d.channel != channel) {
+            self.end_drag();
+            let (correction, calibration) = self.corrections(channel);
+            let trace = self.entry(channel).trace();
+            let farther = |anchor: f64, (a, b): (f64, f64)| {
+                if (a - anchor).abs() >= (b - anchor).abs() {
+                    a
+                } else {
+                    b
+                }
+            };
+            let span = trace.display_span().map_or((0.0, 0.0), |s| (s.from, s.to));
+            self.drag = Some(DragStart {
+                channel,
+                correction,
+                calibration,
+                far_time: farther(drag.anchor.0, span),
+                far_value: trace
+                    .whole_signal()
+                    .map(|range| farther(drag.anchor.1, range)),
+                edit: None,
+            });
+        }
+        let start = self.drag.as_ref().expect("just started");
+        let (anchor_t, anchor_v) = drag.anchor;
+        let (dt, dv) = drag.moved;
+        let edit = if dt != 0.0 {
+            let to = if drag.stretch {
+                stretch_factor(anchor_t, start.far_time, dt)
+                    .map(|f| start.correction.stretched(anchor_t, f))
+            } else {
+                Some(start.correction.shifted(dt))
+            };
+            to.map(|to| self.time_edit(channel, start.correction, to))
+        } else if dv != 0.0
+            && let Some(from) = start.calibration
+        {
+            let to = if drag.stretch {
+                start
+                    .far_value
+                    .and_then(|far| stretch_factor(anchor_v, far, dv))
+                    .map(|f| from.stretched(anchor_v, f))
+            } else {
+                Some(from.offset_by(dv))
+            };
+            to.map(|to| self.calibration_edit(channel, from, to))
+        } else {
+            None
+        };
+        if let Some(edit) = edit {
+            self.recordings[channel.recording].set(&edit.change);
+            self.drag.as_mut().expect("just started").edit = Some(edit);
+        }
+        if drag.released {
+            self.end_drag();
+        }
+    }
+
+    /// A drag that is over: write what it changed and make it one step.
+    fn end_drag(&mut self) {
+        if let Some(DragStart {
+            edit: Some(edit), ..
+        }) = self.drag.take()
+        {
+            let loaded = &self.recordings[edit.recording];
+            if let Err(e) = loaded.save() {
+                self.report(e);
+            }
+            self.history.push(edit);
+        }
+    }
+
+    /// The arrows in Align: move the active stream along time and its
+    /// channel across value, each a change of its own.
+    fn nudge(&mut self, (dt, dv): (f64, f64)) {
+        let Some(channel) = self.plot.active else {
+            return;
+        };
+        self.end_drag();
+        let (correction, calibration) = self.corrections(channel);
+        if dt != 0.0 {
+            self.commit(self.time_edit(channel, correction, correction.shifted(dt)));
+        }
+        if dv != 0.0
+            && let Some(calibration) = calibration
+        {
+            let to = calibration.offset_by(dv);
+            self.commit(self.calibration_edit(channel, calibration, to));
+        }
+    }
+
+    /// The Align sidebar: the active channel's shift, `k` (also as ppm and as
+    /// the corrected rate), gain and offset. Each takes a typed value on
+    /// Enter or when it loses focus; Escape leaves it as it was.
+    fn align_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.strong("Align");
+        ui.add_space(4.0);
+        let weak = ui.visuals().weak_text_color();
+        let Some(channel) = self.plot.active else {
+            ui.label(
+                egui::RichText::new("click a legend on the plot to pick the stream to align")
+                    .small()
+                    .color(weak),
+            );
+            return;
+        };
+        let dark = ui.visuals().dark_mode;
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+            ui.painter().hline(
+                rect.x_range(),
+                rect.center().y,
+                Stroke::new(2.0, self.color(channel, dark)),
+            );
+            ui.label(self.label(channel));
+        });
+        let entry = self.entry(channel);
+        let (correction, calibration) = self.corrections(channel);
+        // The rate the stream's samples arrive at on its own clock: fitted
+        // when there is a fit.
+        let base_hz = match entry.rates {
+            Some(Rates { fit: Some(fit), .. }) => fit.rate_hz,
+            Some(rates) => rates.nominal_hz,
+            None => entry.trace.rate_hz(),
+        };
+        let stream = entry.stream.clone();
+        let channel_id = entry.channel.clone();
+
+        let mut time = None;
+        let mut values = None;
+        ui.add_space(8.0);
+        section(ui, &format!("time · {stream}"), weak);
+        egui::Grid::new("time fields")
+            .num_columns(3)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                let typing = &mut self.typing;
+                let c = correction;
+                if let Some(v) = field(
+                    ui,
+                    typing,
+                    Field::Shift,
+                    "shift",
+                    "s",
+                    format!("{:.6}", c.shift_s),
+                ) {
+                    time = Some(Correction { shift_s: v, ..c });
+                }
+                if let Some(v) = field(ui, typing, Field::K, "k", "", format!("{:.9}", c.k)) {
+                    time = (v > 0.0).then_some(Correction { k: v, ..c });
+                }
+                let ppm = (c.k - 1.0) * 1e6;
+                if let Some(v) = field(ui, typing, Field::Ppm, "", "ppm", format!("{ppm:+.3}")) {
+                    let k = 1.0 + v * 1e-6;
+                    time = (k > 0.0).then_some(Correction { k, ..c });
+                }
+                let rate = base_hz / c.k;
+                if let Some(v) = field(ui, typing, Field::Rate, "rate", "Hz", format!("{rate:.6}"))
+                {
+                    time = (v > 0.0).then_some(Correction {
+                        k: base_hz / v,
+                        ..c
+                    });
+                }
+            });
+        ui.label(
+            egui::RichText::new(format!("rate is {base_hz:.4} Hz on its own clock ÷ k"))
+                .small()
+                .color(weak),
+        );
+        ui.add_space(8.0);
+        section(ui, &format!("calibration · {channel_id}"), weak);
+        match calibration {
+            Some(c) => {
+                egui::Grid::new("value fields")
+                    .num_columns(3)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        let typing = &mut self.typing;
+                        if let Some(v) = field(ui, typing, Field::Gain, "gain", "", plain(c.gain)) {
+                            values = Some(Calibration { gain: v, ..c });
+                        }
+                        if let Some(v) =
+                            field(ui, typing, Field::Offset, "offset", "", plain(c.offset))
+                        {
+                            values = Some(Calibration { offset: v, ..c });
+                        }
+                    });
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("a residual has no calibration")
+                        .small()
+                        .color(weak),
+                );
+            }
+        }
+        if let Some(to) = time {
+            self.end_drag();
+            self.commit(self.time_edit(channel, correction, to));
+        }
+        if let (Some(to), Some(from)) = (values, calibration) {
+            self.end_drag();
+            self.commit(self.calibration_edit(channel, from, to));
+        }
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("saved to the recording's header.json on every change  ·  ⌘Z undo")
+                .small()
+                .color(weak),
+        );
+    }
+
     /// While a channel is dragged: say where it would land, and on release
     /// put it there. Onto the plot it overlays or opens a panel; a legend
     /// dragged back onto the tree leaves its panel.
@@ -541,16 +947,26 @@ impl eframe::App for App {
         for path in dropped {
             self.start_load(path);
         }
-        ctx.input(|i| {
-            if i.key_pressed(Key::O) {
-                self.plot.orientation = self.plot.orientation.toggled();
-            }
-            for mode in Mode::ALL {
-                if i.key_pressed(mode.key()) {
-                    self.plot.mode = mode;
+        // Keys typed into a field are the field's.
+        if !ctx.egui_wants_keyboard_input() {
+            let undo = ctx.input(|i| {
+                if i.key_pressed(Key::O) {
+                    self.plot.orientation = self.plot.orientation.toggled();
                 }
+                for mode in Mode::ALL {
+                    if i.key_pressed(mode.key()) {
+                        self.plot.mode = mode;
+                    }
+                }
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z)
+            });
+            if undo {
+                self.undo();
             }
-        });
+        }
+        if self.plot.mode != Mode::Align {
+            self.end_drag();
+        }
         self.drive_screenshot(ctx);
     }
 
@@ -580,6 +996,12 @@ impl eframe::App for App {
             })
             .response
             .rect;
+        if self.plot.mode == Mode::Align {
+            egui::Panel::right("align")
+                .resizable(false)
+                .exact_size(ALIGN_WIDTH)
+                .show(ui, |ui| self.align_panel(ui));
+        }
         let shown = egui::CentralPanel::no_frame()
             .show(ui, |ui| {
                 let dark = ui.visuals().dark_mode;
@@ -598,6 +1020,17 @@ impl eframe::App for App {
             })
             .inner;
         self.hover_time = shown.hover_time;
+        if let Some(channel) = shown.clicked {
+            self.end_drag();
+            self.plot.active = Some(channel);
+        }
+        if let Some(drag) = shown.align {
+            self.align_drag(drag);
+            ui.ctx().request_repaint();
+        }
+        if let Some(nudge) = shown.nudge {
+            self.nudge(nudge);
+        }
         self.drag_and_drop(ui.ctx(), &shown, tree);
     }
 }
@@ -649,6 +1082,56 @@ fn series<'a>(recordings: &'a [Loaded], layout: &Layout, dark_mode: bool) -> Vec
                 .collect()
         })
         .collect()
+}
+
+/// `v` to 15 significant digits and no trailing zeros: what was typed reads
+/// back as typed, without the noise of the arithmetic behind it.
+fn plain(v: f64) -> String {
+    let v: f64 = format!("{v:.14e}").parse().unwrap_or(v);
+    format!("{}", if v == 0.0 { 0.0 } else { v })
+}
+
+/// A heading in the Align sidebar.
+fn section(ui: &mut egui::Ui, text: &str, weak: Color32) {
+    ui.label(egui::RichText::new(text).small().color(weak));
+}
+
+/// One number in the Align sidebar, as a row of a three-column grid: label,
+/// text field, unit. Shows `shown` until typed into; returns the typed value
+/// once it is committed with Enter or by leaving the field, unless it is
+/// unchanged, not a finite number, or Escape left it.
+fn field(
+    ui: &mut egui::Ui,
+    typing: &mut Option<(Field, String)>,
+    which: Field,
+    label: &str,
+    unit: &str,
+    shown: String,
+) -> Option<f64> {
+    ui.label(label);
+    let mut text = match typing {
+        Some((field, text)) if *field == which => text.clone(),
+        _ => shown.clone(),
+    };
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .desired_width(130.0)
+            .font(egui::TextStyle::Monospace),
+    );
+    ui.label(unit);
+    ui.end_row();
+    if response.has_focus() {
+        *typing = Some((which, text));
+        return None;
+    }
+    if !response.lost_focus() {
+        return None;
+    }
+    *typing = None;
+    if ui.input(|i| i.key_pressed(Key::Escape)) || text == shown {
+        return None;
+    }
+    text.trim().parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 /// A stream's row in the tree: its id, kind and rate, and for a timestamped
@@ -824,7 +1307,7 @@ fn hints(mode: Mode) -> &'static str {
             "drag a channel onto a panel to overlay, to an edge for a new panel, a legend back to the tree to remove  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  drag or arrows pan  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
         }
         Mode::Align => {
-            "dragging to align is not wired up yet  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
+            "click a legend to pick a stream  ·  drag along time shifts it, ⇧ stretches it about the point pressed  ·  drag across value offsets, ⇧ scales  ·  arrows nudge a pixel, ⇧ ten  ·  ⌘Z undo  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
         }
         Mode::Box => {
             "drag a box to fit it  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  arrows pan  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
@@ -846,36 +1329,37 @@ fn load(path: &Path, progress: &Progress) -> Result<Loaded, String> {
         .map(|s| s.channels.len() + 2 * (s.kind == StreamKind::Timestamped) as usize)
         .sum();
     progress.steps.store(steps, Ordering::Relaxed);
-    let mut loaded = Loaded {
-        path: path.to_path_buf(),
-        name: header.name.clone(),
-        entries: Vec::new(),
-        problems: Vec::new(),
-        built: 0,
-        took: Duration::ZERO,
-    };
+    let (mut entries, mut problems, mut built) = (Vec::new(), Vec::new(), 0);
     for stream in &header.streams {
-        if let Err(e) = load_stream(&rec, stream, &mut loaded, progress) {
-            loaded.problems.push(format!("{}: {e}", stream.id));
+        if let Err(e) = load_stream(&rec, stream, &mut entries, &mut built, progress) {
+            problems.push(format!("{}: {e}", stream.id));
         }
     }
-    if loaded.entries.is_empty() {
+    if entries.is_empty() {
         let mut message = format!("{}: no channel to draw", header.name);
-        for problem in &loaded.problems {
+        for problem in &problems {
             message.push_str("; ");
             message.push_str(problem);
         }
         return Err(message);
     }
-    loaded.took = started.elapsed();
-    Ok(loaded)
+    Ok(Loaded {
+        path: path.to_path_buf(),
+        name: header.name.clone(),
+        rec,
+        entries,
+        problems,
+        built,
+        took: started.elapsed(),
+    })
 }
 
 /// Add a stream's channels, and its residual when it is timestamped.
 fn load_stream(
     rec: &Recording,
     stream: &Stream,
-    loaded: &mut Loaded,
+    entries: &mut Vec<Entry>,
+    built: &mut usize,
     progress: &Progress,
 ) -> sigkit_format::Result<()> {
     let report = &mut |done: usize, total: usize| {
@@ -941,7 +1425,7 @@ fn load_stream(
 
     for channel in &stream.channels {
         let (pyramid, source) = rec.pyramid_with_progress(&stream.id, &channel.id, report)?;
-        loaded.built += (source == PyramidSource::Built) as usize;
+        *built += (source == PyramidSource::Built) as usize;
         next_step();
         let trace = Trace::new(
             Values::Column(rec.map_column(&stream.id, &channel.id)?),
@@ -951,9 +1435,7 @@ fn load_stream(
         .calibrated(channel.gain, channel.offset)
         .placed(placement)
         .anchored(stream.utc_anchor.clone());
-        loaded
-            .entries
-            .push(entry(&channel.id, &channel.unit, trace, false, None));
+        entries.push(entry(&channel.id, &channel.unit, trace, false, None));
     }
 
     if let (Some(rates), Some(time)) = (rates, rec.map_time(&stream.id)?) {
@@ -985,10 +1467,8 @@ fn load_stream(
             )?),
             None => None,
         };
-        loaded.built += 1 + fitted.is_some() as usize;
-        loaded
-            .entries
-            .push(entry(RESIDUAL, "ms", nominal, true, fitted));
+        *built += 1 + fitted.is_some() as usize;
+        entries.push(entry(RESIDUAL, "ms", nominal, true, fitted));
     }
     Ok(())
 }
@@ -1007,4 +1487,196 @@ fn save_png(path: &Path, image: &ColorImage) -> Result<(), Box<dyn std::error::E
         .collect();
     encoder.write_header()?.write_image_data(&bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::{Calibration, Change, Correction, Edit};
+    use sigkit_format::synth::{self, PairSpec, Signal, TimestampedSpec};
+    use std::time::SystemTime;
+
+    fn opened(dir: &Path) -> Loaded {
+        load(dir, &Progress::default()).unwrap()
+    }
+
+    /// Every column file's name, bytes and modification time.
+    fn columns(dir: &Path) -> Vec<(String, Vec<u8>, SystemTime)> {
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
+            .map(|p| {
+                let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read(&p).unwrap(), mtime)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn on_disk(dir: &Path) -> (f64, f64, f64, f64) {
+        let rec = Recording::open(dir).unwrap();
+        let stream = rec.header().stream("signal").unwrap();
+        let tc = &stream.time_correction;
+        let ch = &stream.channels[0];
+        (tc.k, tc.shift_s, ch.gain, ch.offset)
+    }
+
+    #[test]
+    fn an_align_change_moves_the_whole_stream_and_rewrites_the_header_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t.sigrec");
+        synth::timestamped(&TimestampedSpec {
+            name: "t".into(),
+            rate_nominal_hz: 100.0,
+            duration_s: 10.0,
+            jitter_s: 0.0,
+            drop_fraction: 0.0,
+            ppm: 0.0,
+            signal: Signal::default(),
+            seed: 1,
+        })
+        .write(&dir)
+        .unwrap();
+        let mut loaded = opened(&dir);
+        let before = columns(&dir);
+        // The channel and the stream's residual.
+        assert_eq!(loaded.entries.len(), 2);
+        let span = |l: &Loaded, e: usize| l.entries[e].trace().display_span().unwrap();
+        assert_eq!(span(&loaded, 1).from, 0.0);
+        let first = loaded.entries[0].trace().nearest(0.0).unwrap().value;
+
+        let shift = Edit {
+            recording: 0,
+            change: Change::Time {
+                stream: "signal".into(),
+                from: Correction {
+                    k: 1.0,
+                    shift_s: 0.0,
+                },
+                to: Correction {
+                    k: 2.0,
+                    shift_s: 0.25,
+                },
+            },
+        };
+        let gain = Edit {
+            recording: 0,
+            change: Change::Calibration {
+                stream: "signal".into(),
+                channel: "value".into(),
+                from: Calibration {
+                    gain: 1.0,
+                    offset: 0.0,
+                },
+                to: Calibration {
+                    gain: -3.0,
+                    offset: 0.5,
+                },
+            },
+        };
+        for edit in [&shift, &gain] {
+            loaded.set(&edit.change);
+            loaded.save().unwrap();
+        }
+        assert_eq!(on_disk(&dir), (2.0, 0.25, -3.0, 0.5));
+        assert_eq!(
+            loaded.correction("signal"),
+            Correction {
+                k: 2.0,
+                shift_s: 0.25
+            }
+        );
+        assert_eq!(
+            loaded.calibration("signal", "value"),
+            Calibration {
+                gain: -3.0,
+                offset: 0.5
+            }
+        );
+        for e in 0..2 {
+            assert_eq!(span(&loaded, e).from, 0.25, "entry {e}");
+            assert!((span(&loaded, e).to - 20.25).abs() < 1e-9, "entry {e}");
+        }
+        let reading = loaded.entries[0].trace().nearest(0.25).unwrap();
+        assert_eq!((reading.index, reading.value), (0, -3.0 * first + 0.5));
+        assert_eq!(columns(&dir), before, "column bytes and mtimes");
+
+        for (edit, expected) in [
+            (&gain, (2.0, 0.25, 1.0, 0.0)),
+            (&shift, (1.0, 0.0, 1.0, 0.0)),
+        ] {
+            loaded.set(&edit.reversed().change);
+            loaded.save().unwrap();
+            assert_eq!(on_disk(&dir), expected);
+        }
+        assert_eq!(span(&loaded, 0).from, 0.0);
+        assert_eq!(columns(&dir), before, "column bytes and mtimes");
+    }
+
+    #[test]
+    fn the_pair_lines_up_when_k_and_shift_are_the_injected_drift_and_shift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ppm_a, ppm_b, shift_s) = (-500.0, 2000.0, 0.25);
+        let pair = synth::pair(&PairSpec {
+            name: "pair".into(),
+            rate_nominal_hz: 416.0,
+            duration_s: 10.0,
+            jitter_s: 0.0,
+            drop_fraction: 0.0,
+            ppm_a,
+            ppm_b,
+            shift_s,
+            signal: Signal {
+                noise_sd: 0.0,
+                ..Signal::default()
+            },
+            seed: 1,
+        });
+        let [a, b] = ["a", "b"].map(|name| tmp.path().join(format!("{name}.sigrec")));
+        pair[0].write(&a).unwrap();
+        pair[1].write(&b).unwrap();
+        let (a, mut b) = (opened(&a), opened(&b));
+
+        // Most a and b disagree on one display instant, nearest sample
+        // against nearest sample.
+        let worst = |b: &Loaded| {
+            (1..19)
+                .map(|i| {
+                    let t = 0.5 * i as f64;
+                    let value = |l: &Loaded| l.entries[0].trace().nearest(t).unwrap().value;
+                    (value(&a) - value(b)).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        // A clock running `ppm` fast stamps `1 + ppm · 1e-6` times too few
+        // seconds per physical second; b starts `shift_s` physical seconds
+        // after a.
+        let scale = |ppm: f64| 1.0 / (1.0 + ppm * 1e-6);
+        let truth = Correction {
+            k: scale(ppm_a) / scale(ppm_b),
+            shift_s: shift_s * scale(ppm_a),
+        };
+        let mut set = |to: Correction| {
+            let from = b.correction("signal");
+            b.set(&Change::Time {
+                stream: "signal".into(),
+                from,
+                to,
+            });
+            worst(&b)
+        };
+        // Two samples' worth of a 1 Hz unit sine is about 0.03.
+        assert!(set(truth) < 0.03, "aligned: {}", set(truth));
+        let shift_only = truth.stretched(truth.shift_s, 1.0 / truth.k);
+        assert!(set(shift_only) > 0.1, "drift left in: {}", set(shift_only));
+        assert!(
+            set(Correction {
+                k: 1.0,
+                shift_s: 0.0
+            }) > 0.5
+        );
+    }
 }

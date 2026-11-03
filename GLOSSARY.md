@@ -16,8 +16,8 @@
 | **Residual** | The virtual channel `t_i − (i / f + t0)` of a timestamped stream. Jitter shows as noise, dropped samples as steps of `1/f`, clock drift as a slope (against nominal) that vanishes when the fit is subtracted. |
 | **Recording's zero** | Display time 0 of a recording. Each clock domain in a recording has its own zero: the earliest first stamp among the recording's streams in that domain, whatever their units. A fixed-rate stream starts at the zero. In code, a stream's offset from it is `start_s`. |
 | **Display time** | Where a sample is drawn: `k · (start_s + t) + shift`, with `t` seconds from the stream's first sample (its *local* time). In code, `Placement` holds `start_s`, `k` and `shift`. |
-| **Time correction** | Per-stream `k` and `shift`: display time is `k · t + shift`. The tool that stretches and moves a signal against another. Persisted in the header. |
-| **Calibration** | Per-channel `gain` and `offset`: display value is `gain · raw + offset`. Persisted in the header. |
+| **Time correction** | Per-stream `k` and `shift`: display time is `k · t + shift`. The tool that stretches and moves a signal against another. Persisted in the header. In code, `Correction`. |
+| **Calibration** | Per-channel `gain` and `offset`: display value is `gain · raw + offset`. Persisted in the header. In code, `Calibration`. |
 | **Pyramid** | The min/max decimation levels built per channel at open time and cached inside the recording. Binned by time; base bin is 64 nominal intervals; each level above merges two bins. Bins hold `f32` min and max; a bin covering no sample is empty and stays a gap at every level. |
 | **Base bin** | The finest pyramid level. Below it the widget reads raw samples for the viewport straight from the memory-mapped column. |
 | **Cache** | `.cache/<stream>.<channel>.pyr` inside a recording: a pyramid plus the fingerprint of the columns it was built from (length and mtime of each, dtype, base bin). A fingerprint mismatch means rebuild. Regenerable, never committed. |
@@ -36,8 +36,12 @@
 | **Animation** | A jump of the view (zoom key, wheel notch, autoscale, box) eases out over 150 ms (in code, `Tween`). The next direct gesture interrupts it where it is. |
 | **Legend** | The chips in a panel's free corner, one per channel, with its colour and name and, under the cursor, its nearest sample's value and stamp. Double-click fits that channel's whole signal; dragging a chip moves its channel to another panel, or back to the tree to remove it. |
 | **Channel palette** | The fixed colours channels are drawn in, by their place in the tree across every open recording (so the same channel of two recordings differs on an overlay), each with a light-theme and a dark-theme shade. |
-| **Align** | The mode where the active stream is dragged directly on the plot: along time = shift, Shift+along = k anchored under the cursor, across = offset, Shift+across = gain anchored under the cursor. |
-| **Drag anchor** | The point under the cursor that stays fixed while stretching in Align. |
+| **Align** | The mode where the active stream is dragged directly on the plot: along time = shift, Shift+along = k anchored under the cursor, across = offset, Shift+across = gain anchored under the cursor. A drag commits to along or across after its first few pixels. |
+| **Active stream** | The stream Align moves, picked by clicking one of its channels' legends; that channel is the one whose calibration Align changes. In code, `PlotState::active`, a channel. |
+| **Drag anchor** | The point under the cursor that stays fixed while stretching in Align: where the drag was pressed. |
+| **Far end** | What a stretch pulls along with the pointer: the end of the stream's display span farther from the drag anchor (for `k`), or the farther extreme of the channel's whole signal (for `gain`). Zoomed out it is a rubber band; zoomed in, a fine adjustment. |
+| **Nudge** | An arrow key in Align: the active stream moves one pixel the way the arrow points (ten with Shift), along time as shift, across value as offset. |
+| **Undo** | `Cmd+Z` takes back the session's header edits one change at a time, on screen and on disk. A change is a drag, a nudge or a typed field. In code, an `Edit` in the `History`. |
 | **Box** | The mode that draws a rectangle and autoscales to it on release. |
 | **Autoscale** | Fit the value axis to: the visible window, the whole signal, or a box. |
 | **Workspace** | A `.sigws.json` file: which recordings are open together, panels, orientation, view ranges, mode. Saved explicitly. Not part of any recording. |

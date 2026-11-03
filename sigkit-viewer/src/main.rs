@@ -1,6 +1,7 @@
 //! `sigkit-viewer`: look at `.sigrec` recordings honestly. Candles at every
 //! zoom, gestures first. See `docs/specs/` and `GLOSSARY.md`.
 
+mod align;
 mod app;
 mod layout;
 mod motion;

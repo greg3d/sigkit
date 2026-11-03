@@ -31,13 +31,19 @@ const MIN_BOX_PX: f32 = 4.0;
 const ZOOM_STEP: f64 = 2.0;
 /// What an arrow key pans by, as a fraction of the visible span.
 const ARROW_PAN: f32 = 0.25;
+/// How far an Align drag goes, in pixels, before it commits to moving along
+/// time or across value.
+const AXIS_LOCK_PX: f64 = 4.0;
+/// Pixels an arrow key nudges the active stream by in Align, and with Shift.
+const NUDGE_PX: f32 = 1.0;
+const SHIFT_NUDGE_PX: f32 = 10.0;
 
 /// The mouse tool. Keys 1, 2, 3 are its accelerators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Drag pans, with inertia (the default).
     Pan,
-    /// Drag the active stream to align it. Arrives with ticket 06.
+    /// Drag the active stream to align it; the arrows nudge it.
     Align,
     /// Drag a rectangle; the view fits it on release.
     Box,
@@ -131,6 +137,10 @@ pub struct PlotState {
     box_from: Option<(PanelId, Pos2)>,
     /// The panel the keys act on: the one last under the pointer.
     focus: Option<PanelId>,
+    /// The channel Align moves, picked by clicking its legend.
+    pub active: Option<ChannelRef>,
+    /// An Align drag in progress.
+    grab: Option<Grab>,
     /// A cursor at this display time while the pointer is off the plot, for
     /// scripted screenshots.
     pub pinned_cursor: Option<f64>,
@@ -163,6 +173,8 @@ impl PlotState {
             velocity: VelocityTracker::default(),
             box_from: None,
             focus: None,
+            active: None,
+            grab: None,
             pinned_cursor: None,
             wheel: Vec::new(),
             candles: Vec::new(),
@@ -216,6 +228,11 @@ impl PlotState {
     /// True while the views animate or coast.
     pub fn is_moving(&self) -> bool {
         self.tween.is_some() || self.inertia.is_some()
+    }
+
+    /// An Align drag in progress is over: the rest of it moves nothing.
+    pub fn let_go(&mut self) {
+        self.grab = None;
     }
 
     /// Whatever moved stops where it is: a direct gesture takes over, or the
@@ -288,6 +305,74 @@ impl PlotState {
     }
 }
 
+/// An Align drag in progress: where it was pressed, the panel's mapping
+/// then, and once it has gone far enough, which axis it moves along.
+struct Grab {
+    panel: PanelId,
+    press: Pos2,
+    mapping: Mapping,
+    axis: Option<Axis>,
+    stretch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Time,
+    Value,
+}
+
+impl Grab {
+    /// The drag with the pointer at `pointer`, measured in the mapping it
+    /// started in, so the anchor stays where it was pressed. The first
+    /// [`AXIS_LOCK_PX`] decide the axis, and whether `shift` makes it a
+    /// stretch, for the rest of the drag.
+    fn follow(&mut self, pointer: Pos2, shift: bool, started: bool, released: bool) -> AlignDrag {
+        let (t0, v0) = self.mapping.data_at(self.press);
+        let (t1, v1) = self.mapping.data_at(pointer);
+        let (dt, dv) = (t1 - t0, v1 - v0);
+        if self.axis.is_none() {
+            let along = dt.abs() / self.mapping.time_per_px();
+            let across = dv.abs() / self.mapping.value_per_px();
+            if along.max(across) >= AXIS_LOCK_PX {
+                self.axis = Some(if along >= across {
+                    Axis::Time
+                } else {
+                    Axis::Value
+                });
+                self.stretch = shift;
+            }
+        }
+        let moved = match self.axis {
+            Some(Axis::Time) => (dt, 0.0),
+            Some(Axis::Value) => (0.0, dv),
+            None => (0.0, 0.0),
+        };
+        AlignDrag {
+            anchor: (t0, v0),
+            moved,
+            stretch: self.stretch,
+            started,
+            released,
+        }
+    }
+}
+
+/// An Align drag this frame, in display units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlignDrag {
+    /// Display time and value under the press: the drag anchor.
+    pub anchor: (f64, f64),
+    /// How far the pointer has moved since the press, along time or across
+    /// value; the other is zero.
+    pub moved: (f64, f64),
+    /// Stretch about the anchor instead of moving.
+    pub stretch: bool,
+    /// The press was this frame: whatever a drag before it left is done.
+    pub started: bool,
+    /// The pointer let go: the drag is one change.
+    pub released: bool,
+}
+
 /// One channel a panel draws and how it is labelled.
 pub struct Series<'a> {
     pub trace: &'a Trace,
@@ -307,6 +392,13 @@ pub struct Shown {
     pub area: Rect,
     /// Each panel's rectangle, in layout order.
     pub panels: Vec<Rect>,
+    /// A legend clicked: Align moves its channel from now on.
+    pub clicked: Option<ChannelRef>,
+    /// The active channel dragged in Align.
+    pub align: Option<AlignDrag>,
+    /// The active channel nudged by the arrows in Align: display time and
+    /// value to add.
+    pub nudge: Option<(f64, f64)>,
 }
 
 impl Shown {
@@ -437,6 +529,9 @@ pub fn show(
         hover_time: None,
         area,
         panels: panels.rects.clone(),
+        clicked: None,
+        align: None,
+        nudge: None,
     };
     if area.width() < 2.0 || area.height() < 2.0 {
         return shown;
@@ -456,8 +551,10 @@ pub fn show(
     let now = ui.input(|i| i.time);
     state.clock = now;
     state.bounds = time_bounds(series);
-    // Quietly: nobody pushed, the time or the channels just changed.
+    // Quietly: nobody pushed, the time or the channels just changed. Not
+    // under an Align drag, which measures in the view it started in.
     if state.tween.is_none()
+        && state.grab.is_none()
         && let Some(bounds) = state.bounds
     {
         state.time = state.time.within(bounds);
@@ -529,7 +626,43 @@ pub fn show(
                     }
                 }
             }
-            Mode::Align => {}
+            Mode::Align => {
+                let holds_active = holds(&series[i], state.active);
+                if holds_active && (response.hovered() || response.dragged()) {
+                    ui.ctx().set_cursor_icon(if response.dragged() {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        egui::CursorIcon::Grab
+                    });
+                }
+                let mut started = false;
+                if response.drag_started()
+                    && holds_active
+                    && let Some(press) = ui.input(|i| i.pointer.press_origin())
+                    && let Some(mapping) = panels.mapping(&state.views(layout), id)
+                {
+                    state.interrupt();
+                    state.grab = Some(Grab {
+                        panel: id,
+                        press,
+                        mapping,
+                        axis: None,
+                        stretch: false,
+                    });
+                    started = true;
+                }
+                let released = response.drag_stopped();
+                if (response.dragged() || released)
+                    && let Some(grab) = state.grab.as_mut().filter(|g| g.panel == id)
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    shown.align = Some(grab.follow(pointer, shift, started, released));
+                }
+                if released {
+                    state.grab = None;
+                }
+            }
         }
         // Double-click fits this panel to the visible window.
         if response.double_clicked() {
@@ -537,9 +670,15 @@ pub fn show(
         }
     }
 
+    if state.mode != Mode::Align {
+        state.grab = None;
+    }
+
+    // Keys typed into a field are not the plot's.
+    let typing = ui.ctx().egui_wants_keyboard_input();
     // A or Shift+A: the panel under the pointer, or every panel.
     let (key_a, shift) = ui.input(|i| (i.key_pressed(Key::A), i.modifiers.shift));
-    if key_a {
+    if key_a && !typing {
         let which: Vec<usize> = match hovered {
             Some(i) => vec![i],
             None => (0..panels.ids.len()).collect(),
@@ -551,7 +690,14 @@ pub fn show(
         .focus
         .and_then(|id| panels.ids.iter().position(|&p| p == id))
         .unwrap_or(0);
-    keys(ui, state, layout, &panels, focus, pointer, now);
+    // Align nudges in the focused panel when it shows the active channel,
+    // else in the first one that does.
+    let nudged = std::iter::once(focus)
+        .chain(0..panels.ids.len())
+        .find(|&i| holds(&series[i], state.active));
+    if !typing {
+        shown.nudge = keys(ui, state, layout, &panels, focus, nudged, pointer, now);
+    }
 
     if state.is_moving() {
         ui.ctx().request_repaint();
@@ -613,13 +759,39 @@ pub fn show(
                 channel: series[i][k].channel,
                 from: Some(id),
             });
+            if response.clicked() {
+                shown.clicked = Some(series[i][k].channel);
+            }
             if response.double_clicked()
                 && let Some(value) = fitted_value([series[i][k].trace], None)
             {
                 let time = state.target(layout).time;
                 state.animate_panel(layout, id, View { time, value }, now);
             }
-            chip.draw(&painter, &colors, series[i][k].color, response.hovered());
+            let active = state.mode == Mode::Align && state.active == Some(series[i][k].channel);
+            chip.draw(
+                &painter,
+                &colors,
+                series[i][k].color,
+                response.hovered(),
+                active,
+            );
+        }
+
+        // A stretch's anchor: the point that stays put.
+        if let Some(grab) = &state.grab
+            && grab.panel == id
+            && grab.stretch
+            && grab.axis.is_some()
+        {
+            let (t, v) = grab.mapping.data_at(grab.press);
+            let at = mapping.screen_pos(t, v);
+            let line = series[i]
+                .iter()
+                .find(|s| Some(s.channel) == state.active)
+                .map_or(colors.text, |s| s.color);
+            painter.circle(at, 5.0, colors.background, Stroke::new(1.5, line));
+            painter.circle_filled(at, 1.5, line);
         }
 
         if state.mode == Mode::Box
@@ -759,19 +931,27 @@ pub fn autoscale(
     state.animate_to(layout, target, now);
 }
 
+/// Whether `series` draws `channel`.
+fn holds(series: &[Series], channel: Option<ChannelRef>) -> bool {
+    channel.is_some_and(|c| series.iter().any(|s| s.channel == c))
+}
+
 /// The plot's keys, on the focused panel: `+`/`-` zoom time by two about the
 /// cursor (or the centre), with `Shift` value; the arrows pan by a quarter
-/// view, except in Align, which keeps them for nudging. Each is a step, so
-/// it eases.
+/// view, each a step, so it eases. In Align the arrows nudge the active
+/// channel instead, shown in panel `nudged`, by a pixel (`Shift`: ten) the
+/// way they point: the display time and value to add are returned.
+#[allow(clippy::too_many_arguments)]
 fn keys(
     ui: &Ui,
     state: &mut PlotState,
     layout: &Layout,
     panels: &Panels,
     focus: usize,
+    nudged: Option<usize>,
     cursor: Option<Pos2>,
     now: f64,
-) {
+) -> Option<(f64, f64)> {
     let (zoom, value, arrow) = ui.input(|i| {
         let mut zoom = 1.0;
         let mut arrow = Vec2::ZERO;
@@ -797,12 +977,19 @@ fn keys(
         }
         (zoom, i.modifiers.shift, arrow)
     });
+    if state.mode == Mode::Align && arrow != Vec2::ZERO {
+        let i = nudged?;
+        let mapping = panels.mapping(&state.views(layout), panels.ids[i])?;
+        let step = if value { SHIFT_NUDGE_PX } else { NUDGE_PX };
+        let from = panels.rects[i].center();
+        let (t0, v0) = mapping.data_at(from);
+        let (t1, v1) = mapping.data_at(from + arrow * step);
+        return Some((t1 - t0, v1 - v0));
+    }
     let id = panels.ids[focus];
     let rect = panels.rects[focus];
     let target = state.target(layout);
-    let Some(mapping) = panels.mapping(&target, id) else {
-        return;
-    };
+    let mapping = panels.mapping(&target, id)?;
     if zoom != 1.0 {
         let about = cursor
             .filter(|p| rect.contains(*p))
@@ -813,11 +1000,12 @@ fn keys(
             mapping.zoomed_time(zoom, about)
         };
         state.animate_to(layout, target.with_panel(id, view), now);
-    } else if arrow != Vec2::ZERO && state.mode != Mode::Align {
+    } else if arrow != Vec2::ZERO {
         // The window moves the way the arrow points; the content the other.
         let view = mapping.panned(-arrow * rect.size() * ARROW_PAN);
         state.animate_to(layout, target.with_panel(id, view), now);
     }
+    None
 }
 
 /// The unit every channel on a panel shares, or none when they differ.
@@ -1060,13 +1248,24 @@ impl Legend {
 }
 
 impl Chip {
-    fn draw(&self, painter: &egui::Painter, colors: &Colors, line: Color32, hovered: bool) {
+    /// The chip, outlined in its channel's colour when Align moves it.
+    fn draw(
+        &self,
+        painter: &egui::Painter,
+        colors: &Colors,
+        line: Color32,
+        hovered: bool,
+        active: bool,
+    ) {
         let fill = if hovered {
             colors.pill_hover
         } else {
             colors.pill
         };
         painter.rect_filled(self.rect, 6.0, fill);
+        if active {
+            painter.rect_stroke(self.rect, 6.0, Stroke::new(1.5, line), StrokeKind::Inside);
+        }
         let x = self.rect.min.x + Legend::PAD.x;
         let mut y = self.rect.min.y + Legend::PAD.y;
         let name_mid = y + self.name.size().y / 2.0;

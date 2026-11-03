@@ -171,6 +171,21 @@ impl Trace {
         Trace { utc_anchor, ..self }
     }
 
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+
+    /// Move and stretch the trace in display time, as Align does.
+    pub fn set_placement(&mut self, placement: Placement) {
+        self.placement = placement;
+    }
+
+    /// Display value becomes `gain · raw + offset`, as Align does.
+    pub fn set_calibration(&mut self, gain: f64, offset: f64) {
+        self.gain = gain;
+        self.offset = offset;
+    }
+
     #[cfg(test)]
     pub fn pyramid(&self) -> &Pyramid {
         &self.pyramid

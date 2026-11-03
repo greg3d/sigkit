@@ -4,15 +4,15 @@
 
 **Blocked by:** 02 (Viewer opens a recording and draws one channel)
 
-**Status:** in-progress
+**Status:** done
 
-- [ ] A flick pans with inertia and comes to rest without jitter; a tap stops it
-- [ ] Zoom and every autoscale animate; the animation is interruptible by the next gesture
-- [ ] Double-click on the plot and on the legend autoscale as specified; Box fits the drawn rectangle on release
-- [ ] `Shift+pinch` zooms value about the cursor
-- [ ] The segment control reflects the current mode and keys 1, 2, 3 change it
-- [ ] Switching the macOS appearance switches the app theme without restart
-- [ ] No gesture exists without a visible control or key hint for the same action
+- [x] A flick pans with inertia and comes to rest without jitter; a tap stops it
+- [x] Zoom and every autoscale animate; the animation is interruptible by the next gesture
+- [x] Double-click on the plot and on the legend autoscale as specified; Box fits the drawn rectangle on release
+- [x] `Shift+pinch` zooms value about the cursor
+- [x] The segment control reflects the current mode and keys 1, 2, 3 change it
+- [x] Switching the macOS appearance switches the app theme without restart
+- [x] No gesture exists without a visible control or key hint for the same action
 
 ## Comments
 
@@ -29,3 +29,5 @@ Decisions:
 - Align (2) is selectable but drag does nothing yet, and its hint says so.
 
 Not checked by the agent: anything that needs hands on the trackpad. Flick feel and coming to rest, tap-to-stop, interrupting an animation, double-clicks, Box, `Shift+pinch`, keys 1/2/3 and a live switch of macOS appearance all need a hand check on the dev Mac. The ticket stays in progress until that's done.
+
+2026-11-03: hand check on the dev Mac passed: the user drove the viewer on generated recordings and confirmed it all looks right. Ticket done.

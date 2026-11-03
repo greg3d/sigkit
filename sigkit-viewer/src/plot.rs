@@ -8,7 +8,7 @@
 //! steps) ease to their target and a flick coasts, see [`crate::motion`].
 
 use crate::layout::{ChannelRef, Dragged, Drop, Layout, PanelId, Views};
-use crate::motion::{Inertia, Tween, VelocityTracker};
+use crate::motion::{self, Inertia, Tween, VelocityTracker};
 use crate::ticks;
 use crate::trace::{Reading, Trace};
 use crate::view::{Mapping, Orientation, Span, View};
@@ -116,6 +116,11 @@ pub struct PlotState {
     /// From the earliest start to the latest end of every channel on a panel:
     /// the time span never leaves it.
     bounds: Option<Span>,
+    /// When the view last ran into the start and the end of `bounds`: the
+    /// edge flashes from then.
+    bumped: (Option<f64>, Option<f64>),
+    /// This frame's time, for stamping a bump.
+    clock: f64,
     pub orientation: Orientation,
     pub mode: Mode,
     tween: Option<Tween<Views>>,
@@ -149,6 +154,8 @@ impl PlotState {
         PlotState {
             time,
             bounds: None,
+            bumped: (None, None),
+            clock: 0.0,
             orientation,
             mode: Mode::Pan,
             tween: None,
@@ -176,9 +183,24 @@ impl PlotState {
         self.tween = Some(Tween::new(self.views(layout), target, now));
     }
 
-    /// `time` kept within the channels' time.
-    fn bounded(&self, time: Span) -> Span {
-        self.bounds.map_or(time, |bounds| time.within(bounds))
+    /// `time` kept within the channels' time. An end it went past flashes.
+    fn bounded(&mut self, time: Span) -> Span {
+        let Some(bounds) = self.bounds else {
+            return time;
+        };
+        let past = time.pushed_past(bounds);
+        if past.start {
+            self.bumped.0 = Some(self.clock);
+        }
+        if past.end {
+            self.bumped.1 = Some(self.clock);
+        }
+        time.within(bounds)
+    }
+
+    /// True when the view ran into an end this frame.
+    fn bumped_now(&self) -> bool {
+        self.bumped.0 == Some(self.clock) || self.bumped.1 == Some(self.clock)
     }
 
     /// Where the views are heading: the end of a running animation, or the
@@ -227,6 +249,10 @@ impl PlotState {
             match panels.mapping(&views, id) {
                 Some(mapping) => self.set(layout, &views.with_panel(id, mapping.panned(delta))),
                 None => self.inertia = None,
+            }
+            // A coast that runs into an end stops there.
+            if self.bumped_now() {
+                self.inertia = None;
             }
             if self.inertia.is_some() {
                 self.inertia = (!inertia.is_done(now)).then_some((id, inertia));
@@ -428,9 +454,13 @@ pub fn show(
         return shown;
     }
     let now = ui.input(|i| i.time);
+    state.clock = now;
     state.bounds = time_bounds(series);
-    if state.tween.is_none() {
-        state.time = state.bounded(state.time);
+    // Quietly: nobody pushed, the time or the channels just changed.
+    if state.tween.is_none()
+        && let Some(bounds) = state.bounds
+    {
+        state.time = state.time.within(bounds);
     }
     state.advance(layout, &panels, now);
 
@@ -552,6 +582,9 @@ pub fn show(
             draw_trace(&painter, &mapping, s, state, pixels_per_point);
         }
         grid.draw_labels(&painter, &colors);
+        if draw_edges(&painter, &mapping, state, &colors) {
+            ui.ctx().request_repaint();
+        }
 
         let readings: Vec<Option<Reading>> = series[i]
             .iter()
@@ -833,6 +866,53 @@ fn draw_trace(
     }
 }
 
+/// A thick bar on each end of the panel's time where the view rests
+/// against the start or end of the channels' time, flashing red when the
+/// view ran into it and fading back to grey. True while a flash fades.
+fn draw_edges(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    state: &PlotState,
+    colors: &Colors,
+) -> bool {
+    const THICKNESS: f32 = 4.0;
+    let Some(bounds) = state.bounds else {
+        return false;
+    };
+    let against = mapping.view.time.touches(bounds);
+    let flash = |at: Option<f64>| at.map_or(0.0, |at| motion::flash(state.clock - at));
+    let strength = (flash(state.bumped.0), flash(state.bumped.1));
+    let rect = mapping.rect;
+    let bar = |start: bool| match (mapping.orientation, start) {
+        (Orientation::Vertical, true) => {
+            Rect::from_x_y_ranges(rect.x_range(), rect.min.y..=rect.min.y + THICKNESS)
+        }
+        (Orientation::Vertical, false) => {
+            Rect::from_x_y_ranges(rect.x_range(), rect.max.y - THICKNESS..=rect.max.y)
+        }
+        (Orientation::Horizontal, true) => {
+            Rect::from_x_y_ranges(rect.min.x..=rect.min.x + THICKNESS, rect.y_range())
+        }
+        (Orientation::Horizontal, false) => {
+            Rect::from_x_y_ranges(rect.max.x - THICKNESS..=rect.max.x, rect.y_range())
+        }
+    };
+    let ends = [
+        (true, against.start, strength.0),
+        (false, against.end, strength.1),
+    ];
+    for (start, rests, flash) in ends {
+        if rests || flash > 0.0 {
+            painter.rect_filled(
+                bar(start),
+                0.0,
+                colors.edge.lerp_to_gamma(colors.bump, flash),
+            );
+        }
+    }
+    strength.0 > 0.0 || strength.1 > 0.0
+}
+
 /// The cursor across the panel at display time `t`, a dot on each channel's
 /// nearest sample, and on the time panel the instant itself.
 fn draw_cursor(
@@ -1077,6 +1157,10 @@ struct Colors {
     pill_hover: Color32,
     cursor: Color32,
     separator: Color32,
+    /// An end of the channels' time the view rests against.
+    edge: Color32,
+    /// The flash of an end the view ran into.
+    bump: Color32,
 }
 
 impl Colors {
@@ -1091,6 +1175,8 @@ impl Colors {
                 pill_hover: Color32::from_rgba_unmultiplied(44, 44, 44, 230),
                 cursor: Color32::from_gray(120),
                 separator: Color32::from_gray(60),
+                edge: Color32::from_gray(95),
+                bump: Color32::from_rgb(0xf0, 0x5a, 0x6a),
             }
         } else {
             Colors {
@@ -1102,6 +1188,8 @@ impl Colors {
                 pill_hover: Color32::from_rgba_unmultiplied(236, 236, 236, 235),
                 cursor: Color32::from_gray(140),
                 separator: Color32::from_gray(215),
+                edge: Color32::from_gray(175),
+                bump: Color32::from_rgb(0xe0, 0x2f, 0x44),
             }
         }
     }

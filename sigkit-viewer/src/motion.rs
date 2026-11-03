@@ -22,6 +22,8 @@ const VELOCITY_WINDOW_S: f64 = 0.1;
 const VELOCITY_STALE_S: f64 = 0.05;
 /// How long a view change animates.
 pub const ANIMATION_S: f64 = 0.15;
+/// How long the flash of an edge the view ran into takes to fade.
+pub const FLASH_S: f64 = 0.6;
 
 /// The speed of a pan gesture, from the movements it reported.
 #[derive(Debug, Default)]
@@ -96,6 +98,13 @@ impl Inertia {
         let decay = (-(now - self.started).max(0.0) / DECELERATION_S).exp();
         self.velocity.length() as f64 * decay < REST_SPEED
     }
+}
+
+/// How strongly an edge still flashes `age_s` seconds after the view ran
+/// into it: fully at once, fading out over [`FLASH_S`], gone after.
+pub fn flash(age_s: f64) -> f32 {
+    let u = (age_s / FLASH_S).clamp(0.0, 1.0);
+    ((1.0 - u) * (1.0 - u)) as f32
 }
 
 /// What a [`Tween`] can ease: anything with a straight line between two
@@ -218,6 +227,21 @@ mod tests {
             time: Span::new(t.0, t.1),
             value: Span::new(v.0, v.1),
         }
+    }
+
+    #[test]
+    fn an_edge_flashes_at_full_strength_then_fades_out_for_good() {
+        assert_eq!(flash(0.0), 1.0);
+        assert_eq!(flash(FLASH_S), 0.0);
+        assert_eq!(flash(10.0), 0.0);
+        let mut previous = 1.0;
+        for ms in 1..=600 {
+            let now = flash(ms as f64 / 1000.0);
+            assert!(now <= previous && now >= 0.0, "{ms} ms: {now}");
+            previous = now;
+        }
+        // Most of the red is gone by half time, so it reads as a flash.
+        assert!(flash(FLASH_S / 2.0) < 0.5);
     }
 
     #[test]

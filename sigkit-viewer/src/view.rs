@@ -81,6 +81,23 @@ impl Span {
         }
     }
 
+    /// The ends of `bounds` this span goes past.
+    pub fn pushed_past(&self, bounds: Span) -> Edges {
+        Edges {
+            start: self.from < bounds.from,
+            end: self.to > bounds.to,
+        }
+    }
+
+    /// The ends of `bounds` this span lies against, give or take rounding.
+    pub fn touches(&self, bounds: Span) -> Edges {
+        let slack = 1e-9 * bounds.len().abs().max(self.len().abs());
+        Edges {
+            start: self.from <= bounds.from + slack,
+            end: self.to >= bounds.to - slack,
+        }
+    }
+
     pub fn shifted(&self, by: f64) -> Span {
         Span::new(self.from + by, self.to + by)
     }
@@ -98,6 +115,13 @@ impl Span {
         };
         Span::new(min - pad, max + pad)
     }
+}
+
+/// The two ends of a span: where it starts and where it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Edges {
+    pub start: bool,
+    pub end: bool,
 }
 
 /// What the widget shows: a time span along, a value span across.
@@ -444,6 +468,28 @@ mod tests {
         // Zoomed out past the whole: exactly the whole.
         assert_eq!(Span::new(-100.0, 200.0).within(bounds), bounds);
         assert_eq!(Span::new(50.0, 130.0).within(bounds), bounds);
+    }
+
+    #[test]
+    fn a_span_says_which_ends_of_its_bounds_it_went_past_and_which_it_rests_against() {
+        let bounds = Span::new(0.0, 60.0);
+        let edges = |start, end| Edges { start, end };
+        let past = |from, to| Span::new(from, to).pushed_past(bounds);
+        assert_eq!(past(10.0, 20.0), edges(false, false));
+        assert_eq!(past(55.0, 65.0), edges(false, true));
+        assert_eq!(past(-3.0, 7.0), edges(true, false));
+        assert_eq!(past(-100.0, 200.0), edges(true, true));
+        assert_eq!(past(50.0, 130.0), edges(false, true));
+        // Against an end is not past it.
+        assert_eq!(past(50.0, 60.0), edges(false, false));
+
+        let against = |from, to| Span::new(from, to).touches(bounds);
+        assert_eq!(against(0.0, 10.0), edges(true, false));
+        assert_eq!(against(50.0, 60.0), edges(false, true));
+        assert_eq!(against(0.0, 60.0), edges(true, true));
+        assert_eq!(against(10.0, 20.0), edges(false, false));
+        // Floating point that slid back lands a hair off the end.
+        assert_eq!(against(1e-12, 10.0 + 1e-12), edges(true, false));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! `sigkit`: generate synthetic recordings with known truth, and inspect recordings.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use sigkit_format::synth::{self, FixedRateSpec, PairSpec, Signal, TimestampedSpec};
 use sigkit_format::wallclock::rfc3339_utc;
-use sigkit_format::{Recording, Stream, StreamKind, fit_rate, ppm_from_nominal};
+use sigkit_format::{ClockDomain, Recording, Stream, StreamKind};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -92,6 +92,32 @@ struct ClockArgs {
     /// Probability that any sample after the first is dropped
     #[arg(long, default_value_t = 0.0)]
     drop: f64,
+    /// Clock the stamps are written in
+    #[arg(long, value_enum, default_value_t = ClockArg::Synthetic)]
+    clock: ClockArg,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ClockArg {
+    /// `sigkit.synthetic`, in ns
+    Synthetic,
+    /// `android.elapsedRealtimeNanos`, in ns
+    Android,
+    /// `ios.systemUptime`, in µs
+    Ios,
+}
+
+impl ClockArg {
+    /// The generated recording, moved to this clock.
+    fn apply(self, synthetic: synth::SyntheticRecording) -> synth::SyntheticRecording {
+        match self {
+            ClockArg::Synthetic => synthetic,
+            ClockArg::Android => {
+                synthetic.on_clock(ClockDomain::new("android.elapsedRealtimeNanos", "ns"))
+            }
+            ClockArg::Ios => synthetic.on_clock(ClockDomain::new("ios.systemUptime", "us")),
+        }
+    }
 }
 
 #[derive(Args)]
@@ -164,7 +190,7 @@ fn generate(preset: Preset) -> Result<(), Box<dyn std::error::Error>> {
             signal,
         } => {
             let dir = recording_dir(&out);
-            let synthetic = synth::timestamped(&TimestampedSpec {
+            let synthetic = clock.clock.apply(synth::timestamped(&TimestampedSpec {
                 name: recording_name(&dir),
                 rate_nominal_hz: clock.rate,
                 duration_s: clock.duration,
@@ -173,7 +199,7 @@ fn generate(preset: Preset) -> Result<(), Box<dyn std::error::Error>> {
                 ppm,
                 signal: signal.signal(),
                 seed: signal.seed,
-            });
+            }));
             let rec = synthetic.write(&dir)?;
             println!(
                 "wrote {} ({} samples, nominal {} Hz, {ppm:+} ppm, jitter {} us, drop {})",
@@ -205,6 +231,7 @@ fn generate(preset: Preset) -> Result<(), Box<dyn std::error::Error>> {
                 signal: signal.signal(),
                 seed: signal.seed,
             });
+            let [a, b] = [a, b].map(|r| clock.clock.apply(r));
             for (synthetic, ppm) in [(&a, ppm_a), (&b, ppm_b)] {
                 let dir = base.with_file_name(format!("{}.sigrec", synthetic.header.name));
                 let rec = synthetic.write(&dir)?;
@@ -306,7 +333,7 @@ fn inspect_timestamped(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let clock = stream.time.as_ref().expect("validated at open");
     let nominal = stream.rate_nominal_hz.expect("validated at open");
-    let stamps = rec.read_time(&stream.id)?.unwrap_or_default();
+    let time = rec.map_time(&stream.id)?.expect("timestamped");
     let Some(seconds_per_tick) = stream.seconds_per_tick() else {
         println!(
             "  stream {}: timestamped, {n} samples (unknown clock unit {:?})",
@@ -316,11 +343,14 @@ fn inspect_timestamped(
         println!("    rate nominal {nominal:.3} Hz, fitted: unknown clock unit");
         return Ok(());
     };
-    let duration = match (stamps.first(), stamps.last()) {
+    let duration = match (
+        time.get_i64(0),
+        time.len().checked_sub(1).and_then(|i| time.get_i64(i)),
+    ) {
         (Some(first), Some(last)) => (last - first) as f64 * seconds_per_tick,
         _ => 0.0,
     };
-    let fit = fit_rate(&stamps, seconds_per_tick, nominal);
+    let fit = rec.fit_rate(&stream.id)?;
     let dropped = match fit {
         Some(fit) if fit.missing > 0 => format!(", {} dropped", fit.missing),
         _ => String::new(),
@@ -332,9 +362,10 @@ fn inspect_timestamped(
     println!("    clock {} [{}]", clock.domain, clock.unit);
     match fit {
         Some(fit) => println!(
-            "    rate nominal {nominal:.3} Hz, fitted {:.4} Hz ({:+.1} ppm)",
+            "    rate nominal {nominal:.3} Hz, fitted {:.4} Hz ({:+.2} ± {:.2} ppm)",
             fit.rate_hz,
-            ppm_from_nominal(fit.rate_hz, nominal)
+            fit.ppm(nominal),
+            fit.ppm_sd(nominal)
         ),
         None => println!("    rate nominal {nominal:.3} Hz, fitted: too few samples"),
     }

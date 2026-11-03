@@ -12,14 +12,16 @@
 | **Clock domain** | Which clock a time column counts in (`android.elapsedRealtimeNanos`, `ios.systemUptime`, `gps.utc`, `sigkit.synthetic` for generated recordings, custom) and its unit (`ns`, `us`, `ms`, `s`). Conversion happens on read; stamps stay raw on disk. |
 | **UTC anchor** | A pair (monotonic stamp, UTC) recorded by the logger so a recording can be placed in wall-clock time. Used only in the cursor readout in v1. |
 | **Nominal rate** | The rate the logger requested or the sensor reported, written to the header. Required for every timestamped stream. The reference the residual is computed against by default, and the yardstick the fitted rate uses to tell a dropped sample from jitter. |
-| **Fitted rate** | The rate estimated by least squares over a stream's stamps, against a gap-aware index: consecutive stamps about two nominal intervals apart count as two steps, so dropped samples do not bend the fit. Shown as a number and as ppm from nominal, with the count of missing samples. |
+| **Fitted rate** | The rate estimated by least squares over a stream's stamps, against a gap-aware index: consecutive stamps about two nominal intervals apart count as two steps, so dropped samples do not bend the fit. Shown as a number and as ppm from nominal ± one standard error (the fit's uncertainty, from the scatter of the stamps about the line), with the count of missing samples. |
 | **Residual** | The virtual channel `t_i − (i / f + t0)` of a timestamped stream. Jitter shows as noise, dropped samples as steps of `1/f`, clock drift as a slope (against nominal) that vanishes when the fit is subtracted. |
+| **Recording's zero** | Display time 0 of a recording. Each clock domain in a recording has its own zero: the earliest first stamp among the recording's streams in that domain, whatever their units. A fixed-rate stream starts at the zero. In code, a stream's offset from it is `start_s`. |
+| **Display time** | Where a sample is drawn: `k · (start_s + t) + shift`, with `t` seconds from the stream's first sample (its *local* time). In code, `Placement` holds `start_s`, `k` and `shift`. |
 | **Time correction** | Per-stream `k` and `shift`: display time is `k · t + shift`. The tool that stretches and moves a signal against another. Persisted in the header. |
 | **Calibration** | Per-channel `gain` and `offset`: display value is `gain · raw + offset`. Persisted in the header. |
 | **Pyramid** | The min/max decimation levels built per channel at open time and cached inside the recording. Binned by time; base bin is 64 nominal intervals; each level above merges two bins. Bins hold `f32` min and max; a bin covering no sample is empty and stays a gap at every level. |
 | **Base bin** | The finest pyramid level. Below it the widget reads raw samples for the viewport straight from the memory-mapped column. |
 | **Cache** | `.cache/<stream>.<channel>.pyr` inside a recording: a pyramid plus the fingerprint of the columns it was built from (length and mtime of each, dtype, base bin). A fingerprint mismatch means rebuild. Regenerable, never committed. |
-| **Trace** | In code, one channel ready to draw: its mapped column, its pyramid, its rate and calibration. It answers, per frame, the min and max in each pixel along time. |
+| **Trace** | In code, one channel ready to draw: its values (a mapped column, or a stream's residual), its clock (a rate or a mapped time column), its pyramid, its calibration and its placement in display time. It answers, per frame, the min and max in each pixel along time. |
 | **View** | What the widget shows: a time span along and a value span across, in data units. Orientation does not change a view; the mapping onto the screen does. |
 | **Bin** | One cell of a pyramid level: the `f32` min and max of the samples it covers, or empty (a gap). The same type holds one pixel's candle. |
 | **Mapped column** | A column read through a read-only memory map, so the OS pages it in as the viewport touches it. Never written; a column truncated while mapped kills the process. |
@@ -29,7 +31,11 @@
 | **Overlay** | Several channels on one panel, sharing its value axis. Level mismatches are fixed with gain, not with separate axes. |
 | **Along-time / across-value** | The widget's two axes. The widget never thinks in x and y; orientation maps these to the screen. |
 | **Orientation** | A workspace setting: vertical (time runs top to bottom, panels side by side; the default) or horizontal. |
-| **Mode** | The mouse tool: Pan (default), Align, Box. A segment control at the bottom; keys 1/2/3 are accelerators. |
+| **Mode** | The mouse tool: Pan (default), Align, Box. A segment control at the bottom; keys 1/2/3 are accelerators. Arrow keys pan in Pan and Box; Align keeps them for nudging. |
+| **Flick** | A pan released while still moving. The view coasts with speed decaying as `e^(−t/0.5 s)` (in code, `Inertia`) until it comes to rest; a tap stops it. The OS's own momentum events are ignored. |
+| **Animation** | A jump of the view (zoom key, wheel notch, autoscale, box) eases out over 150 ms (in code, `Tween`). The next direct gesture interrupts it where it is. |
+| **Legend** | The chip in the plot's free corner with a channel's colour and name. Double-click fits the whole signal. |
+| **Channel palette** | The fixed colours channels are drawn in, by their place in the recording, each with a light-theme and a dark-theme shade. |
 | **Align** | The mode where the active stream is dragged directly on the plot: along time = shift, Shift+along = k anchored under the cursor, across = offset, Shift+across = gain anchored under the cursor. |
 | **Drag anchor** | The point under the cursor that stays fixed while stretching in Align. |
 | **Box** | The mode that draws a rectangle and autoscales to it on release. |

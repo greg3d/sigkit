@@ -3,9 +3,11 @@
 use crate::atomic::write_atomic;
 use crate::column::{Column, Dtype, time_from_le_bytes, time_to_le_bytes};
 use crate::error::{Error, Result};
-use crate::header::{Channel, Header, Stream, StreamKind, TIME_COLUMN};
+use crate::header::{Channel, ClockDomain, Header, Stream, StreamKind, TIME_COLUMN};
 use crate::mapped::MappedColumn;
 use crate::pyramid::{BASE_BIN_INTERVALS, Fingerprint, Pyramid};
+use crate::ratefit::{RateFit, fit_rate_by};
+use crate::residual::Residual;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -282,47 +284,10 @@ impl Recording {
                 report(i);
                 value(i)
             }),
-            Some(time) => {
-                time.advise_sequential();
-                let ticks_per_second =
-                    stream
-                        .ticks_per_second()
-                        .ok_or_else(|| Error::InvalidStream {
-                            stream: stream.id.clone(),
-                            reason: "unknown clock unit, cannot bin by time".into(),
-                        })?;
-                let zero = time.get_i64(0).unwrap_or(0);
-                let interval = IntervalCounter::new(rate, ticks_per_second);
-                let bin_of = |i: usize| {
-                    let ticks = time.get_i64(i).expect("i < len").saturating_sub(zero);
-                    usize::try_from(interval.whole_intervals(ticks) / BASE_BIN_INTERVALS as i128)
-                        .unwrap_or(usize::MAX)
-                };
-                let bins = if n == 0 {
-                    0
-                } else {
-                    bin_of(n - 1).saturating_add(1)
-                };
-                // A healthy stream spans about n / 64 base bins; holes add
-                // empty ones. A last stamp that would need over a thousand
-                // times more bins than samples is corrupt, not a hole.
-                if bins > n.saturating_mul(1024).max(1 << 20) {
-                    return Err(Error::InvalidStream {
-                        stream: stream.id.clone(),
-                        reason: format!(
-                            "time column spans {bins} base bins for {n} samples; a stamp looks corrupt"
-                        ),
-                    });
-                }
-                Pyramid::build(
-                    base_bin_s,
-                    bins,
-                    (0..n).map(|i| {
-                        report(i);
-                        (bin_of(i), value(i))
-                    }),
-                )
-            }
+            Some(time) => self.build_time_binned(stream, &time, &mut |i| {
+                report(i);
+                value(i)
+            })?,
         };
         progress(n, n);
         column.advise_random();
@@ -333,6 +298,155 @@ impl Recording {
             let _ = write_atomic(&cache_path, &pyramid.to_cache_bytes(fingerprint));
         }
         Ok((pyramid, PyramidSource::Built))
+    }
+
+    /// Seconds from the recording's zero to the stream's first sample. Each
+    /// clock domain has its own zero: the earliest first stamp of the
+    /// recording's streams in that domain, whatever their units. A fixed-rate
+    /// stream starts at the zero.
+    pub fn start_s(&self, stream_id: &str) -> Result<f64> {
+        let stream = self.stream(stream_id)?;
+        let Some(first) = self.first_stamp_ns(stream)? else {
+            return Ok(0.0);
+        };
+        let domain = &stream.time.as_ref().expect("timestamped").domain;
+        let mut zero = first;
+        for other in &self.header.streams {
+            if other.time.as_ref().is_some_and(|t| &t.domain == domain)
+                && let Some(stamp) = self.first_stamp_ns(other)?
+            {
+                zero = zero.min(stamp);
+            }
+        }
+        Ok((first - zero) as f64 * 1e-9)
+    }
+
+    /// The least-squares rate of a timestamped stream's stamps, read through
+    /// the memory map; `None` for a fixed-rate stream, an unknown clock unit,
+    /// or fewer than two stamps.
+    pub fn fit_rate(&self, stream_id: &str) -> Result<Option<RateFit>> {
+        let stream = self.stream(stream_id)?;
+        let (Some(time), Some(seconds_per_tick), Some(nominal)) = (
+            self.map_time(stream_id)?,
+            stream.seconds_per_tick(),
+            stream.rate_nominal_hz,
+        ) else {
+            return Ok(None);
+        };
+        time.advise_sequential();
+        let fit = fit_rate_by(
+            time.len(),
+            |i| time.get_i64(i).expect("i < len"),
+            seconds_per_tick,
+            nominal,
+        );
+        time.advise_random();
+        Ok(fit)
+    }
+
+    /// The pyramid of a timestamped stream's residual channel, binned by time
+    /// exactly like its other channels. Built on every call, not cached: it
+    /// depends on the residual's rate, and costs one pass over the time
+    /// column.
+    pub fn residual_pyramid(
+        &self,
+        stream_id: &str,
+        residual: &Residual,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Pyramid> {
+        let stream = self.stream(stream_id)?;
+        let time = self
+            .map_time(stream_id)?
+            .ok_or_else(|| Error::InvalidStream {
+                stream: stream.id.clone(),
+                reason: "a fixed-rate stream has no residual".into(),
+            })?;
+        time.advise_sequential();
+        let n = time.len();
+        let pyramid = self.build_time_binned(stream, &time, &mut |i| {
+            if i.is_multiple_of(1 << 16) {
+                progress(i, n);
+            }
+            residual.at(i, time.get_i64(i).expect("i < len"))
+        })?;
+        progress(n, n);
+        time.advise_random();
+        Ok(pyramid)
+    }
+
+    /// Build a pyramid of `value(i)` for a timestamped stream: sample `i` goes
+    /// to base bin `floor(Δticks · rate / ticks_per_second) / 64`, counted
+    /// from the first stamp. The time column must not run backwards.
+    fn build_time_binned(
+        &self,
+        stream: &Stream,
+        time: &MappedColumn,
+        value: &mut dyn FnMut(usize) -> f64,
+    ) -> Result<Pyramid> {
+        let invalid = |reason: String| Error::InvalidStream {
+            stream: stream.id.clone(),
+            reason,
+        };
+        let rate = stream.rate_nominal_hz.expect("validated at open");
+        let ticks_per_second = stream
+            .ticks_per_second()
+            .ok_or_else(|| invalid("unknown clock unit, cannot bin by time".into()))?;
+        let n = time.len();
+        let zero = time.get_i64(0).unwrap_or(0);
+        let interval = IntervalCounter::new(rate, ticks_per_second);
+        let stamp = |i: usize| time.get_i64(i).expect("i < len");
+        let bin_of = |stamp: i64| {
+            usize::try_from(
+                interval.whole_intervals(stamp.saturating_sub(zero)) / BASE_BIN_INTERVALS as i128,
+            )
+            .unwrap_or(usize::MAX)
+        };
+        let bins = if n == 0 {
+            0
+        } else {
+            bin_of(stamp(n - 1)).saturating_add(1)
+        };
+        // A healthy stream spans about n / 64 base bins; holes add empty
+        // ones. A last stamp that would need over a thousand times more bins
+        // than samples is corrupt, not a hole.
+        if bins > n.saturating_mul(1024).max(1 << 20) {
+            return Err(invalid(format!(
+                "time column spans {bins} base bins for {n} samples; a stamp looks corrupt"
+            )));
+        }
+        let mut backwards = None;
+        let mut previous = zero;
+        let pyramid = Pyramid::build(
+            BASE_BIN_INTERVALS as f64 / rate,
+            bins,
+            (0..n).map(|i| {
+                let s = stamp(i);
+                if s < previous && backwards.is_none() {
+                    backwards = Some(i);
+                }
+                previous = s;
+                (bin_of(s), value(i))
+            }),
+        );
+        match backwards {
+            Some(i) => Err(invalid(format!("time column runs backwards at sample {i}"))),
+            None => Ok(pyramid),
+        }
+    }
+
+    /// The first stamp of a timestamped stream in nanoseconds of its clock;
+    /// `None` for a fixed-rate or empty stream, or an unknown clock unit.
+    fn first_stamp_ns(&self, stream: &Stream) -> Result<Option<i128>> {
+        let Some(nanos_per_tick) = stream.time.as_ref().and_then(ClockDomain::nanos_per_tick)
+        else {
+            return Ok(None);
+        };
+        let Some(time) = self.map_time(&stream.id)? else {
+            return Ok(None);
+        };
+        Ok(time
+            .get_i64(0)
+            .map(|stamp| stamp as i128 * nanos_per_tick as i128))
     }
 
     fn stream(&self, stream_id: &str) -> Result<&Stream> {

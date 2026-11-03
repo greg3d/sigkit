@@ -23,15 +23,20 @@ fn inspect(path: &Path) -> String {
     stdout
 }
 
-/// The number before " ppm)" on the line that reports the fitted rate.
-fn fitted_ppm(report: &str) -> f64 {
+/// The ppm and its uncertainty in `(… ± … ppm)` on the fitted rate line.
+fn fitted_ppm_and_sd(report: &str) -> (f64, f64) {
     let line = report
         .lines()
         .find(|l| l.contains("fitted"))
         .expect("a fitted rate line");
     let end = line.find(" ppm)").expect("ppm in parentheses");
     let start = line[..end].rfind('(').unwrap() + 1;
-    line[start..end].parse().unwrap()
+    let (ppm, sd) = line[start..end].split_once(" ± ").expect("ppm ± sd");
+    (ppm.parse().unwrap(), sd.parse().unwrap())
+}
+
+fn fitted_ppm(report: &str) -> f64 {
+    fitted_ppm_and_sd(report).0
 }
 
 #[test]
@@ -102,8 +107,39 @@ fn gen_timestamped_then_inspect_reports_a_fitted_rate_that_recovers_the_ppm() {
     ] {
         assert!(report.contains(needle), "missing {needle:?} in:\n{report}");
     }
-    let ppm = fitted_ppm(&report);
-    assert!((ppm - 150.0).abs() < 2.0, "fitted {ppm} ppm, injected 150");
+    let (ppm, sd) = fitted_ppm_and_sd(&report);
+    assert!(sd > 0.0 && sd < 1.0, "uncertainty {sd} ppm");
+    assert!(
+        (ppm - 150.0).abs() < 4.0 * sd,
+        "fitted {ppm} ± {sd} ppm, injected 150"
+    );
+}
+
+#[test]
+fn gen_timestamped_on_a_phone_clock_writes_that_clock_domain_and_unit() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (clock, domain, unit) in [
+        ("android", "android.elapsedRealtimeNanos", "[ns]"),
+        ("ios", "ios.systemUptime", "[us]"),
+    ] {
+        let out = tmp.path().join(format!("{clock}.sigrec"));
+        let (ok, _, stderr) = sigkit(&[
+            "gen",
+            "timestamped",
+            out.to_str().unwrap(),
+            "--clock",
+            clock,
+            "--duration",
+            "2",
+        ]);
+        assert!(ok, "{stderr}");
+        let report = inspect(&out);
+        assert!(
+            report.contains(&format!("clock {domain} {unit}")),
+            "{report}"
+        );
+        assert!(report.contains("832 samples over 1.998 s"), "{report}");
+    }
 }
 
 #[test]

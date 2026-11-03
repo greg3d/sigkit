@@ -203,6 +203,13 @@ impl Stream {
                 }
             }
         }
+        let tc = &self.time_correction;
+        if !positive_finite(tc.k) || !tc.shift_s.is_finite() {
+            return Err(invalid(format!(
+                "time correction needs a positive `k` and a finite `shift_s`, got k {} and shift {}",
+                tc.k, tc.shift_s
+            )));
+        }
         for (i, channel) in self.channels.iter().enumerate() {
             if !is_valid_id(&channel.id) || channel.id == TIME_COLUMN {
                 return Err(invalid(format!(
@@ -258,6 +265,17 @@ impl ClockDomain {
     /// Seconds per tick of the time column, or `None` for a unit this crate does not know.
     pub fn seconds_per_tick(&self) -> Option<f64> {
         self.ticks_per_second().map(|t| 1.0 / t)
+    }
+
+    /// Nanoseconds per tick, or `None` for a unit this crate does not know.
+    pub fn nanos_per_tick(&self) -> Option<i64> {
+        match self.unit.as_str() {
+            "ns" => Some(1),
+            "us" => Some(1_000),
+            "ms" => Some(1_000_000),
+            "s" => Some(1_000_000_000),
+            _ => None,
+        }
     }
 
     /// Ticks per second: exact in `f64`, so `ticks * rate / ticks_per_second`

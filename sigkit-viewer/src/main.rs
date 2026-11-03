@@ -2,6 +2,7 @@
 //! zoom, gestures first. See `docs/specs/` and `GLOSSARY.md`.
 
 mod app;
+mod motion;
 mod plot;
 mod ticks;
 mod trace;
@@ -25,6 +26,13 @@ struct Cli {
     /// Initial time window in seconds, as `from:to` (default: the whole recording)
     #[arg(long, value_parser = parse_window, value_name = "FROM:TO")]
     time: Option<(f64, f64)>,
+    /// The channel to draw first, as `stream/channel` (`stream/residual` for a
+    /// timestamped stream's residual)
+    #[arg(long, value_name = "STREAM/CHANNEL")]
+    channel: Option<String>,
+    /// Draw a residual against the fitted rate rather than the nominal one
+    #[arg(long, hide = true)]
+    subtract_fit: bool,
     /// Save a PNG of the window once the recording is drawn, then quit
     #[arg(long, hide = true, value_name = "PNG")]
     screenshot: Option<PathBuf>,
@@ -52,6 +60,8 @@ fn main() -> eframe::Result {
             view::Orientation::Vertical
         },
         time: cli.time.map(|(from, to)| view::Span::new(from, to)),
+        channel: cli.channel,
+        subtract_fit: cli.subtract_fit,
         screenshot: cli.screenshot,
     };
     let native = eframe::NativeOptions {

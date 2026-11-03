@@ -13,6 +13,7 @@ pub mod mapped;
 pub mod pyramid;
 pub mod ratefit;
 pub mod recording;
+pub mod residual;
 pub mod synth;
 pub mod wallclock;
 
@@ -23,5 +24,6 @@ pub use header::{
 };
 pub use mapped::MappedColumn;
 pub use pyramid::{BASE_BIN_INTERVALS, Bin, Fingerprint, Pyramid};
-pub use ratefit::{RateFit, fit_rate, ppm_from_nominal};
+pub use ratefit::{RateFit, fit_rate, fit_rate_by, ppm_from_nominal};
 pub use recording::{PyramidSource, Recording, StreamData};
+pub use residual::Residual;

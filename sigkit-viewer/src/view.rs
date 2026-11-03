@@ -68,6 +68,20 @@ pub struct View {
     pub value: Span,
 }
 
+impl View {
+    /// The view a fraction `u` of the way from `a` to `b`, each end of each
+    /// span moving in a straight line. A zoom about a point keeps that point
+    /// fixed all the way.
+    pub fn lerp(a: View, b: View, u: f64) -> View {
+        let span =
+            |a: Span, b: Span| Span::new(a.from + (b.from - a.from) * u, a.to + (b.to - a.to) * u);
+        View {
+            time: span(a.time, b.time),
+            value: span(a.value, b.value),
+        }
+    }
+}
+
 /// A view laid onto a screen rectangle in one orientation: the only place
 /// that knows which screen axis is which.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -193,6 +207,31 @@ impl Mapping {
             value: self.view.value,
         }
     }
+
+    /// The view after zooming value by `factor` (above 1 zooms in) about the
+    /// value under `cursor`, which stays where it is on screen.
+    pub fn zoomed_value(&self, factor: f64, cursor: Pos2) -> View {
+        let (_, v_cursor) = self.data_at(cursor);
+        let len = self.view.value.len();
+        let frac = (v_cursor - self.view.value.from) / len;
+        let new_len = len / factor;
+        let from = v_cursor - frac * new_len;
+        View {
+            time: self.view.time,
+            value: Span::new(from, from + new_len),
+        }
+    }
+
+    /// The view that shows exactly what `rect` covers on screen: what a box
+    /// drawn there fits to.
+    pub fn view_of(&self, rect: Rect) -> View {
+        let (t0, v0) = self.data_at(rect.min);
+        let (t1, v1) = self.data_at(rect.max);
+        View {
+            time: Span::new(t0.min(t1), t0.max(t1)),
+            value: Span::new(v0.min(v1), v0.max(v1)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +318,52 @@ mod tests {
         assert!(z.time.to > z.time.from);
         let z = m.zoomed_time(0.1, m.screen_pos(5.0, 0.0));
         assert_eq!((z.time.from, z.time.to), (-45.0, 55.0));
+    }
+
+    #[test]
+    fn zooming_value_keeps_the_value_under_the_cursor_where_it_is() {
+        for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+            let m = Mapping::new(rect(), orientation, view());
+            let cursor = m.screen_pos(7.0, 0.5);
+            let zoomed = m.zoomed_value(4.0, cursor);
+            assert_eq!(zoomed.time, view().time, "{orientation:?}");
+            assert!((zoomed.value.len() - 0.5).abs() < 1e-12, "{orientation:?}");
+            let (_, v) = Mapping::new(rect(), orientation, zoomed).data_at(cursor);
+            assert!((v - 0.5).abs() < 1e-6, "{orientation:?}: {v}");
+        }
+    }
+
+    #[test]
+    fn a_box_drawn_on_screen_in_any_direction_becomes_the_view() {
+        for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+            let m = Mapping::new(rect(), orientation, view());
+            let (a, b) = (m.screen_pos(2.0, -0.5), m.screen_pos(6.0, 0.25));
+            for (from, to) in [(a, b), (b, a)] {
+                let boxed = m.view_of(Rect::from_two_pos(from, to));
+                assert!(
+                    (boxed.time.from - 2.0).abs() < 1e-5 && (boxed.time.to - 6.0).abs() < 1e-5,
+                    "{orientation:?}: {boxed:?}"
+                );
+                assert!(
+                    (boxed.value.from + 0.5).abs() < 1e-6 && (boxed.value.to - 0.25).abs() < 1e-6,
+                    "{orientation:?}: {boxed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_view_between_two_others_interpolates_both_axes_end_by_end() {
+        let a = view();
+        let b = View {
+            time: Span::new(4.0, 6.0),
+            value: Span::new(0.0, 3.0),
+        };
+        assert_eq!(View::lerp(a, b, 0.0), a);
+        assert_eq!(View::lerp(a, b, 1.0), b);
+        let mid = View::lerp(a, b, 0.5);
+        assert_eq!((mid.time.from, mid.time.to), (2.0, 8.0));
+        assert_eq!((mid.value.from, mid.value.to), (-0.5, 2.0));
     }
 
     #[test]

@@ -106,6 +106,28 @@ pub struct SyntheticRecording {
 }
 
 impl SyntheticRecording {
+    /// The same recording stamped on `clock` instead of the synthetic
+    /// nanosecond clock: stamps and UTC anchors are converted to its unit
+    /// (rounding down), so the recording reads as the same times in seconds.
+    /// For checking clock-domain handling, e.g. `ios.systemUptime` in `us`.
+    pub fn on_clock(mut self, clock: ClockDomain) -> SyntheticRecording {
+        let per_tick = clock
+            .nanos_per_tick()
+            .expect("a clock unit this crate knows");
+        for (stream, data) in self.header.streams.iter_mut().zip(&mut self.streams) {
+            if let Some(time) = &mut data.time {
+                for stamp in time.iter_mut() {
+                    *stamp = stamp.div_euclid(per_tick);
+                }
+            }
+            if let Some(anchor) = &mut stream.utc_anchor {
+                anchor.mono = anchor.mono.div_euclid(per_tick);
+            }
+            stream.time = Some(clock.clone());
+        }
+        self
+    }
+
     /// Write to `dir` as a `.sigrec` recording.
     pub fn write(&self, dir: impl AsRef<Path>) -> crate::Result<Recording> {
         Recording::create(dir, self.header.clone(), &self.streams)

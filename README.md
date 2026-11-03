@@ -26,6 +26,8 @@ cargo run -p sigkit-cli -- gen pair out/pair --shift 0.25 --ppm-b 150
 cargo run -p sigkit-cli -- inspect out/pair-b.sigrec
 cargo run --release -p sigkit-viewer -- out/hour.sigrec            # or drop a recording on the window
 cargo run --release -p sigkit-viewer -- out/hour.sigrec --horizontal --time 10:13
+cargo run -p sigkit-cli -- gen timestamped out/drift --ppm 50 --drop 0.005 --clock ios
+cargo run --release -p sigkit-viewer -- out/drift.sigrec --channel signal/residual
 ```
 
-In the viewer: pinch zooms time about the cursor, two-finger scroll pans, `A` autoscales to the visible window, `Shift+A` to the whole signal, `O` toggles orientation. The hidden `--screenshot <png>` flag saves the window once drawn and quits, for checking renders by hand.
+In the viewer: pinch (or `+`/`−`) zooms time about the cursor, `Shift` with either zooms value; two-finger scroll, dragging in Pan mode and the arrow keys pan, and a flick coasts until a tap stops it. `A` or double-click autoscales to the visible window, `Shift+A` or double-click on the legend to the whole signal; in Box mode a drawn rectangle becomes the view. `1`, `2`, `3` switch Pan, Align, Box (also the segment control at the bottom); `O` toggles orientation. The channel picker at the bottom reaches every channel and each timestamped stream's residual, with the fitted rate in ppm and a toggle that subtracts it. The hidden `--screenshot <png>` flag saves the window once drawn and quits, for checking renders by hand.

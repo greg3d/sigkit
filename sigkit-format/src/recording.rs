@@ -434,19 +434,22 @@ impl Recording {
         }
     }
 
-    /// The first stamp of a timestamped stream in nanoseconds of its clock;
-    /// `None` for a fixed-rate or empty stream, or an unknown clock unit.
+    /// The first stamp of a timestamped stream in nanoseconds of its clock:
+    /// exact for a unit of time, to the nearest nanosecond for a sample
+    /// counter. `None` for a fixed-rate or empty stream, or an unknown unit.
     fn first_stamp_ns(&self, stream: &Stream) -> Result<Option<i128>> {
-        let Some(nanos_per_tick) = stream.time.as_ref().and_then(ClockDomain::nanos_per_tick)
-        else {
+        let Some(ticks_per_second) = stream.ticks_per_second() else {
             return Ok(None);
         };
-        let Some(time) = self.map_time(&stream.id)? else {
+        let Some(first) = self.map_time(&stream.id)?.and_then(|time| time.get_i64(0)) else {
             return Ok(None);
         };
-        Ok(time
-            .get_i64(0)
-            .map(|stamp| stamp as i128 * nanos_per_tick as i128))
+        Ok(Some(
+            match stream.time.as_ref().and_then(ClockDomain::nanos_per_tick) {
+                Some(nanos_per_tick) => first as i128 * nanos_per_tick as i128,
+                None => (first as f64 * 1e9 / ticks_per_second).round() as i128,
+            },
+        ))
     }
 
     fn stream(&self, stream_id: &str) -> Result<&Stream> {

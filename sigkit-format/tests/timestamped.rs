@@ -190,3 +190,88 @@ fn a_generated_recording_moved_to_another_clock_keeps_its_times_in_seconds() {
         ns.header.streams[0].utc_anchor.as_ref().unwrap().utc_ns
     );
 }
+
+#[test]
+fn a_hardware_sample_counter_ticks_once_per_nominal_interval_and_shows_every_lost_sample() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut header = Header::new("counter");
+    header.streams = vec![
+        stream("s", "hw.counter", "samples", 100.0),
+        stream("early", "hw.counter", "samples", 100.0),
+    ];
+    // Counter from 5000: 3 samples lost after sample 10, 40 after sample 50.
+    let counter: Vec<i64> = (0..200i64)
+        .map(|i| 5000 + i + if i > 10 { 3 } else { 0 } + if i > 50 { 40 } else { 0 })
+        .collect();
+    let rec = Recording::create(
+        tmp.path().join("c.sigrec"),
+        header,
+        &[data(counter.clone()), data(vec![4900, 4901])],
+    )
+    .unwrap();
+
+    let s = rec.header().stream("s").unwrap();
+    assert_eq!(s.seconds_per_tick(), Some(0.01));
+    assert_eq!(rec.start_s("s").unwrap(), 1.0);
+    assert_eq!(rec.start_s("early").unwrap(), 0.0);
+
+    // A counter does not jitter: the fit is the nominal rate, to rounding.
+    let fit = rec.fit_rate("s").unwrap().unwrap();
+    assert!((fit.rate_hz - 100.0).abs() < 1e-9, "{}", fit.rate_hz);
+    assert!(fit.rate_sd_hz < 1e-9, "{}", fit.rate_sd_hz);
+    assert_eq!(fit.missing, 43);
+
+    let residual = Residual::against_nominal(counter[0], 0.01, 100.0);
+    let r: Vec<f64> = counter
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| residual.at(i, c))
+        .collect();
+    for (i, step) in r.windows(2).map(|w| w[1] - w[0]).enumerate() {
+        let lost = match i {
+            10 => 3.0,
+            50 => 40.0,
+            _ => 0.0,
+        };
+        assert!(
+            (step - lost * 0.01).abs() < 1e-12,
+            "after sample {i}: {step}"
+        );
+    }
+
+    // Binned by counter ticks: 243 intervals span four base bins.
+    let (pyramid, _) = rec.pyramid("s", "v").unwrap();
+    assert_eq!(pyramid.level(0).len(), 4);
+}
+
+#[test]
+fn a_generated_recording_moved_to_a_sample_counter_counts_the_dropped_samples() {
+    use sigkit_format::synth::{self, Signal, TimestampedSpec};
+    let spec = TimestampedSpec {
+        name: "counter".into(),
+        rate_nominal_hz: 416.0,
+        duration_s: 10.0,
+        jitter_s: 100e-6,
+        drop_fraction: 0.02,
+        ppm: 80.0,
+        signal: Signal::default(),
+        seed: 5,
+    };
+    let ns = synth::timestamped(&spec);
+    let counted = synth::timestamped(&spec).on_clock(ClockDomain::new("hw.counter", "samples"));
+
+    let (stamps, counter) = (
+        ns.streams[0].time.as_ref().unwrap(),
+        counted.streams[0].time.as_ref().unwrap(),
+    );
+    assert_eq!(stamps.len(), counter.len());
+    for (i, (s, c)) in stamps.windows(2).zip(counter.windows(2)).enumerate() {
+        let intervals = ((s[1] - s[0]) as f64 * 416.0 / 1e9).round() as i64;
+        assert_eq!(c[1] - c[0], intervals, "after sample {i}");
+    }
+    let total_drops = (counter[counter.len() - 1] - counter[0]) as usize + 1 - counter.len();
+    assert!(total_drops > 50, "{total_drops} drops");
+    let stream = &counted.header.streams[0];
+    assert_eq!(stream.time, Some(ClockDomain::new("hw.counter", "samples")));
+    assert_eq!(stream.utc_anchor.as_ref().unwrap().mono, counter[0]);
+}

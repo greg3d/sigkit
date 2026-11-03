@@ -33,6 +33,10 @@ const CLOCK_A_ZERO_NS: i64 = 1_000_000_000_000;
 /// recording visibly has its own zero.
 const CLOCK_B_ZERO_NS: i64 = 5_000_000_000_000;
 
+/// First count of a generated sample counter: not zero, so a reader that
+/// forgets to count from the first stamp shows it.
+pub const COUNTER_ZERO: i64 = 1_000_000;
+
 /// A sine plus Gaussian noise.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Signal {
@@ -107,21 +111,40 @@ pub struct SyntheticRecording {
 
 impl SyntheticRecording {
     /// The same recording stamped on `clock` instead of the synthetic
-    /// nanosecond clock: stamps and UTC anchors are converted to its unit
-    /// (rounding down), so the recording reads as the same times in seconds.
-    /// For checking clock-domain handling, e.g. `ios.systemUptime` in `us`.
+    /// nanosecond clock, for checking clock-domain handling:
+    /// - a unit of time (`ios.systemUptime` in `us`, say): stamps and UTC
+    ///   anchors are converted to it, rounding down, so the recording reads
+    ///   as the same times in seconds;
+    /// - a sample counter: stamps become a hardware counter from
+    ///   [`COUNTER_ZERO`], stepping by the nominal intervals between
+    ///   consecutive stamps (one, plus one per dropped sample), as a counter
+    ///   clocked with the samples would. It neither jitters nor drifts
+    ///   against itself. The anchor moves to the first count.
     pub fn on_clock(mut self, clock: ClockDomain) -> SyntheticRecording {
-        let per_tick = clock
-            .nanos_per_tick()
-            .expect("a clock unit this crate knows");
         for (stream, data) in self.header.streams.iter_mut().zip(&mut self.streams) {
+            let nominal_hz = stream.rate_nominal_hz.unwrap_or(1.0);
             if let Some(time) = &mut data.time {
-                for stamp in time.iter_mut() {
-                    *stamp = stamp.div_euclid(per_tick);
+                if clock.is_sample_counter() {
+                    let mut count = COUNTER_ZERO;
+                    let mut previous = time.first().copied().unwrap_or(0);
+                    for stamp in time.iter_mut() {
+                        let intervals = ((*stamp - previous) as f64 * nominal_hz / 1e9).round();
+                        count += (intervals as i64).max((*stamp != previous) as i64);
+                        previous = *stamp;
+                        *stamp = count;
+                    }
+                } else {
+                    let per_tick = clock.nanos_per_tick().expect("a unit this crate knows");
+                    for stamp in time.iter_mut() {
+                        *stamp = stamp.div_euclid(per_tick);
+                    }
                 }
             }
             if let Some(anchor) = &mut stream.utc_anchor {
-                anchor.mono = anchor.mono.div_euclid(per_tick);
+                anchor.mono = match clock.nanos_per_tick() {
+                    Some(per_tick) => anchor.mono.div_euclid(per_tick),
+                    None => COUNTER_ZERO,
+                };
             }
             stream.time = Some(clock.clone());
         }

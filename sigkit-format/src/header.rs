@@ -14,6 +14,10 @@ use serde_json::{Map, Value};
 /// The `sigrec` header version this crate reads and writes.
 pub const SIGREC_VERSION: u32 = 1;
 
+/// Clock unit of a hardware sample counter: one tick per nominal interval,
+/// so its ticks per second are the stream's nominal rate.
+pub const SAMPLE_COUNTER_UNIT: &str = "samples";
+
 /// Name of the time column in file names and error messages: `<stream>.t.bin`.
 /// Reserved: no channel may use it.
 pub const TIME_COLUMN: &str = "t";
@@ -160,13 +164,19 @@ impl Stream {
     /// Seconds per tick of the time column; `None` for a fixed-rate stream or
     /// a clock unit this crate does not know.
     pub fn seconds_per_tick(&self) -> Option<f64> {
-        self.time.as_ref()?.seconds_per_tick()
+        self.ticks_per_second().map(|t| 1.0 / t)
     }
 
-    /// Ticks of the time column per second; `None` for a fixed-rate stream or
-    /// a clock unit this crate does not know.
+    /// Ticks of the time column per second: the clock unit's, or the nominal
+    /// rate for a sample counter. `None` for a fixed-rate stream or a clock
+    /// unit this crate does not know.
     pub fn ticks_per_second(&self) -> Option<f64> {
-        self.time.as_ref()?.ticks_per_second()
+        let time = self.time.as_ref()?;
+        if time.is_sample_counter() {
+            self.rate_nominal_hz
+        } else {
+            time.ticks_per_second()
+        }
     }
 
     /// File name of a channel column: `<stream>.<channel>.bin`.
@@ -244,7 +254,8 @@ fn is_valid_id(id: &str) -> bool {
             .any(|c| matches!(c, '.' | '/' | '\\') || c.is_control())
 }
 
-/// Which clock a time column counts in, and its unit (`ns`, `us`, `ms`, `s`).
+/// Which clock a time column counts in, and its unit: `ns`, `us`, `ms`, `s`,
+/// or `samples` for a hardware counter ticking once per nominal interval.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClockDomain {
     pub domain: String,
@@ -262,12 +273,20 @@ impl ClockDomain {
         }
     }
 
-    /// Seconds per tick of the time column, or `None` for a unit this crate does not know.
+    /// True for a hardware sample counter, whose tick length is the stream's
+    /// nominal interval rather than a unit of time.
+    pub fn is_sample_counter(&self) -> bool {
+        self.unit == SAMPLE_COUNTER_UNIT
+    }
+
+    /// Seconds per tick of a unit of time; `None` for a sample counter (see
+    /// [`Stream::seconds_per_tick`]) or a unit this crate does not know.
     pub fn seconds_per_tick(&self) -> Option<f64> {
         self.ticks_per_second().map(|t| 1.0 / t)
     }
 
-    /// Nanoseconds per tick, or `None` for a unit this crate does not know.
+    /// Nanoseconds per tick of a unit of time; `None` for a sample counter or
+    /// a unit this crate does not know.
     pub fn nanos_per_tick(&self) -> Option<i64> {
         match self.unit.as_str() {
             "ns" => Some(1),
@@ -278,8 +297,9 @@ impl ClockDomain {
         }
     }
 
-    /// Ticks per second: exact in `f64`, so `ticks * rate / ticks_per_second`
-    /// stays exact where the true value is representable.
+    /// Ticks per second of a unit of time: exact in `f64`, so
+    /// `ticks * rate / ticks_per_second` stays exact where the true value is
+    /// representable. `None` for a sample counter or an unknown unit.
     pub fn ticks_per_second(&self) -> Option<f64> {
         match self.unit.as_str() {
             "ns" => Some(1e9),

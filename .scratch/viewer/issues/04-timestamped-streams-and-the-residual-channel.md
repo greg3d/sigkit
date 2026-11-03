@@ -61,3 +61,12 @@ Decisions:
 - `sigkit gen … --clock android|ios` writes `android.elapsedRealtimeNanos` in ns or `ios.systemUptime` in µs, for checking clock domains.
 
 Open: "a break in the signal line at every zoom" is met only where the zoom can resolve a gap (see above). Confirm that reading or reword the criterion. Caching the residual pyramids (and the fit) is the follow-up.
+
+2026-11-03: added the clock unit `samples`, for a hardware sample counter. Real loggers either leave a lost sample out or write a zero in its place, and some carry a hardware counter that is exact. With unit `samples`, ticks per second are the stream's nominal rate:
+- the residual shows each lost sample as an exact step of `1/f`, with no jitter;
+- the fit is the nominal rate, and `missing` counts the lost samples exactly;
+- binning and the recording's zero work as for any other clock.
+
+`sigkit gen … --clock counter` writes such a recording (`sigkit.counter`, counting from 1 000 000).
+
+Zeros written in place of lost samples are left alone for now: without stamps they cannot be told from data, and no heuristic is wanted yet.

@@ -20,7 +20,8 @@ pub mod wallclock;
 pub use column::{Column, Dtype};
 pub use error::{Error, Result};
 pub use header::{
-    Channel, ClockDomain, Header, Stream, StreamKind, TIME_COLUMN, TimeCorrection, UtcAnchor,
+    Channel, ClockDomain, Header, SAMPLE_COUNTER_UNIT, Stream, StreamKind, TIME_COLUMN,
+    TimeCorrection, UtcAnchor,
 };
 pub use mapped::MappedColumn;
 pub use pyramid::{BASE_BIN_INTERVALS, Bin, Fingerprint, Pyramid};

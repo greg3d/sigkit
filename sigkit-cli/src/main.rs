@@ -3,7 +3,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use sigkit_format::synth::{self, FixedRateSpec, PairSpec, Signal, TimestampedSpec};
 use sigkit_format::wallclock::rfc3339_utc;
-use sigkit_format::{ClockDomain, Recording, Stream, StreamKind};
+use sigkit_format::{ClockDomain, Recording, SAMPLE_COUNTER_UNIT, Stream, StreamKind};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -105,6 +105,8 @@ enum ClockArg {
     Android,
     /// `ios.systemUptime`, in µs
     Ios,
+    /// `sigkit.counter`, a hardware sample counter: one tick per nominal interval
+    Counter,
 }
 
 impl ClockArg {
@@ -116,6 +118,9 @@ impl ClockArg {
                 synthetic.on_clock(ClockDomain::new("android.elapsedRealtimeNanos", "ns"))
             }
             ClockArg::Ios => synthetic.on_clock(ClockDomain::new("ios.systemUptime", "us")),
+            ClockArg::Counter => {
+                synthetic.on_clock(ClockDomain::new("sigkit.counter", SAMPLE_COUNTER_UNIT))
+            }
         }
     }
 }

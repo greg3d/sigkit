@@ -116,11 +116,12 @@ fn gen_timestamped_then_inspect_reports_a_fitted_rate_that_recovers_the_ppm() {
 }
 
 #[test]
-fn gen_timestamped_on_a_phone_clock_writes_that_clock_domain_and_unit() {
+fn gen_timestamped_on_another_clock_writes_that_clock_domain_and_unit() {
     let tmp = tempfile::tempdir().unwrap();
     for (clock, domain, unit) in [
         ("android", "android.elapsedRealtimeNanos", "[ns]"),
         ("ios", "ios.systemUptime", "[us]"),
+        ("counter", "sigkit.counter", "[samples]"),
     ] {
         let out = tmp.path().join(format!("{clock}.sigrec"));
         let (ok, _, stderr) = sigkit(&[

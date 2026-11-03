@@ -821,13 +821,13 @@ fn fitted_value(trace: &Trace, time: Span) -> Span {
 fn hints(mode: Mode) -> &'static str {
     match mode {
         Mode::Pan => {
-            "drag a channel onto a panel to overlay, to an edge for a new panel, a legend back to the tree to remove  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll, drag or arrows pan  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
+            "drag a channel onto a panel to overlay, to an edge for a new panel, a legend back to the tree to remove  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  drag or arrows pan  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
         }
         Mode::Align => {
-            "dragging to align is not wired up yet  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
+            "dragging to align is not wired up yet  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
         }
         Mode::Box => {
-            "drag a box to fit it  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll or arrows pan  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
+            "drag a box to fit it  ·  pinch or +/− zoom time  ·  ⇧ value  ·  scroll pans time  ·  ⇧scroll value  ·  arrows pan  ·  A or double-click fit  ·  ⇧A or double-click legend fit all  ·  O orientation"
         }
     }
 }

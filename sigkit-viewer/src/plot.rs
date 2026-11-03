@@ -113,6 +113,9 @@ pub fn channel_color(index: usize, dark_mode: bool) -> Color32 {
 pub struct PlotState {
     /// What every panel shows along time.
     pub time: Span,
+    /// From the earliest start to the latest end of every channel on a panel:
+    /// the time span never leaves it.
+    bounds: Option<Span>,
     pub orientation: Orientation,
     pub mode: Mode,
     tween: Option<Tween<Views>>,
@@ -134,6 +137,7 @@ pub struct PlotState {
 
 /// One scroll event the plot acts on.
 struct Wheel {
+    /// Already a pan: along time, or with Shift across value.
     delta: Vec2,
     unit: MouseWheelUnit,
     phase: TouchPhase,
@@ -144,6 +148,7 @@ impl PlotState {
     pub fn new(time: Span, orientation: Orientation) -> PlotState {
         PlotState {
             time,
+            bounds: None,
             orientation,
             mode: Mode::Pan,
             tween: None,
@@ -165,9 +170,15 @@ impl PlotState {
     }
 
     /// Ease from what the panels show to `target`.
-    pub fn animate_to(&mut self, layout: &Layout, target: Views, now: f64) {
+    pub fn animate_to(&mut self, layout: &Layout, mut target: Views, now: f64) {
+        target.time = self.bounded(target.time);
         self.inertia = None;
         self.tween = Some(Tween::new(self.views(layout), target, now));
+    }
+
+    /// `time` kept within the channels' time.
+    fn bounded(&self, time: Span) -> Span {
+        self.bounds.map_or(time, |bounds| time.within(bounds))
     }
 
     /// Where the views are heading: the end of a running animation, or the
@@ -193,7 +204,7 @@ impl PlotState {
     }
 
     fn set(&mut self, layout: &mut Layout, views: &Views) {
-        self.time = views.time;
+        self.time = self.bounded(views.time);
         views.apply_to(layout);
     }
 
@@ -337,6 +348,16 @@ impl Panels {
     }
 }
 
+/// From the earliest first sample to the latest last one of every channel
+/// on the panels, in display time.
+fn time_bounds(series: &[Vec<Series>]) -> Option<Span> {
+    series
+        .iter()
+        .flatten()
+        .filter_map(|s| s.trace.display_span())
+        .reduce(|a, b| Span::new(a.from.min(b.from), a.to.max(b.to)))
+}
+
 /// The value span that fits every one of `traces` over `time`, or over its
 /// whole signal when `time` is `None`; `None` when there is nothing to fit.
 pub fn fitted_value<'a>(
@@ -363,8 +384,8 @@ pub fn fitted_value<'a>(
 /// - pinch zooms time about the cursor, `Shift+pinch` the value of the panel
 ///   under it; `+`/`-` zoom time by two about the cursor (with `Shift`,
 ///   value), animated;
-/// - two-finger scroll pans and, released moving, coasts; dragging in Pan
-///   mode does the same; the arrow keys pan by a quarter view (not in
+/// - two-finger scroll and the wheel pan along time, with `Shift` across
+///   value, and released moving coast; dragging in Pan mode pans both; the arrow keys pan by a quarter view (not in
 ///   Align); a tap stops a coast;
 /// - double-click fits a panel's value axis to the visible window, `A` the
 ///   panel under the pointer (every panel when it is over none), `Shift+A`
@@ -372,7 +393,8 @@ pub fn fitted_value<'a>(
 ///   channel's whole signal; a box drawn in Box mode becomes the view. All
 ///   animate.
 ///
-/// Every panel shows the same time; a gesture in one moves time in all of
+/// Every panel shows the same time, never past the first or last sample of
+/// the channels on them; a gesture in one moves time in all of
 /// them and value only in itself. A legend chip dragged away carries its
 /// channel as a [`Dragged`] payload.
 pub fn show(
@@ -406,6 +428,10 @@ pub fn show(
         return shown;
     }
     let now = ui.input(|i| i.time);
+    state.bounds = time_bounds(series);
+    if state.tween.is_none() {
+        state.time = state.bounded(state.time);
+    }
     state.advance(layout, &panels, now);
 
     let pointer = ui
@@ -598,8 +624,9 @@ pub fn show(
     shown
 }
 
-/// Two-finger scroll, wheels and pinch over panel `i`. The OS's own momentum
-/// is ignored: the plot coasts by itself, so a tap can stop it.
+/// Two-finger scroll, wheels and pinch over panel `i`. A scroll pans along
+/// time, with Shift across value. The OS's own momentum is ignored: the plot
+/// coasts by itself, so a tap can stop it.
 fn scroll_and_pinch(
     ui: &Ui,
     state: &mut PlotState,
@@ -610,6 +637,7 @@ fn scroll_and_pinch(
     now: f64,
 ) {
     let id = panels.ids[i];
+    let orientation = state.orientation;
     state.wheel.clear();
     ui.input(|input| {
         state
@@ -622,7 +650,7 @@ fn scroll_and_pinch(
                     source,
                     modifiers,
                 } if !modifiers.command && !modifiers.ctrl => Some(Wheel {
-                    delta: *delta,
+                    delta: orientation.scroll(*delta, modifiers.shift),
                     unit: *unit,
                     phase: *phase,
                     source: *source,

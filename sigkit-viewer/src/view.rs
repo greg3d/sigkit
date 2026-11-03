@@ -18,6 +18,26 @@ pub enum Orientation {
 }
 
 impl Orientation {
+    /// A scroll of `delta` points as a pan: along time, or with `shift`
+    /// across value, by its larger component, whichever way the wheel or the
+    /// fingers went.
+    pub fn scroll(self, delta: Vec2, shift: bool) -> Vec2 {
+        let amount = if delta.y.abs() >= delta.x.abs() {
+            delta.y
+        } else {
+            delta.x
+        };
+        // Time is y when vertical, x when horizontal; value the other one.
+        match (self, shift) {
+            (Orientation::Vertical, false) | (Orientation::Horizontal, true) => {
+                Vec2::new(0.0, amount)
+            }
+            (Orientation::Horizontal, false) | (Orientation::Vertical, true) => {
+                Vec2::new(amount, 0.0)
+            }
+        }
+    }
+
     pub fn toggled(self) -> Orientation {
         match self {
             Orientation::Vertical => Orientation::Horizontal,
@@ -45,6 +65,20 @@ impl Span {
     /// A fraction `u` of the way from `a` to `b`, each end in a straight line.
     pub fn lerp(a: Span, b: Span, u: f64) -> Span {
         Span::new(a.from + (b.from - a.from) * u, a.to + (b.to - a.to) * u)
+    }
+
+    /// This span moved, at its length, to lie inside `bounds`; `bounds`
+    /// itself when it is longer.
+    pub fn within(&self, bounds: Span) -> Span {
+        if self.len() >= bounds.len() {
+            bounds
+        } else if self.from < bounds.from {
+            self.shifted(bounds.from - self.from)
+        } else if self.to > bounds.to {
+            self.shifted(bounds.to - self.to)
+        } else {
+            *self
+        }
     }
 
     pub fn shifted(&self, by: f64) -> Span {
@@ -377,6 +411,39 @@ mod tests {
         let a = Mapping::new(rect(), Orientation::Vertical, v).view;
         let b = Mapping::new(rect(), Orientation::Horizontal, v).view;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn scrolling_moves_along_time_and_with_shift_across_value_in_both_orientations() {
+        let wheel = vec2(0.0, -30.0);
+        // macOS turns a Shift+wheel into a sideways scroll.
+        let sideways = vec2(-30.0, 0.0);
+        let diagonal = vec2(4.0, -30.0);
+        let v = Orientation::Vertical;
+        assert_eq!(v.scroll(wheel, false), vec2(0.0, -30.0));
+        assert_eq!(v.scroll(diagonal, false), vec2(0.0, -30.0));
+        assert_eq!(v.scroll(sideways, true), vec2(-30.0, 0.0));
+        assert_eq!(v.scroll(wheel, true), vec2(-30.0, 0.0));
+        let h = Orientation::Horizontal;
+        assert_eq!(h.scroll(wheel, false), vec2(-30.0, 0.0));
+        assert_eq!(h.scroll(sideways, false), vec2(-30.0, 0.0));
+        assert_eq!(h.scroll(sideways, true), vec2(0.0, -30.0));
+        // Along time, whichever way it is laid out.
+        let m = Mapping::new(rect(), h, view());
+        let moved = m.panned(h.scroll(wheel, false));
+        assert!(moved.time.from > 0.0 && moved.value == view().value);
+    }
+
+    #[test]
+    fn a_span_kept_within_bounds_slides_back_inside_and_never_grows_past_them() {
+        let bounds = Span::new(0.0, 60.0);
+        assert_eq!(Span::new(10.0, 20.0).within(bounds), Span::new(10.0, 20.0));
+        // Panned past either end: back against it, the same length.
+        assert_eq!(Span::new(55.0, 65.0).within(bounds), Span::new(50.0, 60.0));
+        assert_eq!(Span::new(-3.0, 7.0).within(bounds), Span::new(0.0, 10.0));
+        // Zoomed out past the whole: exactly the whole.
+        assert_eq!(Span::new(-100.0, 200.0).within(bounds), bounds);
+        assert_eq!(Span::new(50.0, 130.0).within(bounds), bounds);
     }
 
     #[test]

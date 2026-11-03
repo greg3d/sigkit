@@ -10,7 +10,7 @@
 //! `k · (start_s + local) + shift_s`. Everything public speaks display time.
 
 use crate::view::Span;
-use sigkit_format::{Bin, MappedColumn, Pyramid, Residual, UtcAnchor};
+use sigkit_format::{Bin, Dtype, MappedColumn, Pyramid, Residual, UtcAnchor};
 
 /// Tolerance, in pixels (or samples), when deciding which pixel a sample or
 /// bin falls in: a value on a boundary belongs to the pixel that starts there
@@ -86,6 +86,44 @@ impl Placement {
 
     fn local(&self, display: f64) -> f64 {
         (display - self.shift_s) / self.k - self.start_s
+    }
+}
+
+/// One sample as the cursor reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reading {
+    pub index: usize,
+    /// The sample's display instant.
+    pub time: f64,
+    /// `gain · raw + offset`.
+    pub value: f64,
+    /// The raw stamp, in the clock domain's unit, on a time column.
+    pub stamp: Option<i64>,
+    /// The column stores `f32`, so the value has only `f32` digits.
+    pub single: bool,
+}
+
+impl Reading {
+    /// The value with the digits its column holds and no more: an `f32`
+    /// sample as the shortest text that reads back as that `f32`, anything
+    /// wider to 15 significant digits. Very small or large values in
+    /// exponent form.
+    pub fn value_text(&self) -> String {
+        fn text<T: std::fmt::Display + std::fmt::LowerExp>(v: T, magnitude: f64) -> String {
+            if magnitude != 0.0 && !(1e-4..1e15).contains(&magnitude) {
+                format!("{v:e}")
+            } else {
+                format!("{v}")
+            }
+        }
+        let value = if self.value == 0.0 { 0.0 } else { self.value };
+        if self.single {
+            let v = value as f32;
+            text(v, v.abs() as f64)
+        } else {
+            let v: f64 = format!("{value:.14e}").parse().unwrap_or(value);
+            text(v, v.abs())
+        }
     }
 }
 
@@ -328,6 +366,45 @@ impl Trace {
         (!all.is_empty()).then(|| self.calibrated_pair(all.min as f64, all.max as f64))
     }
 
+    /// The sample nearest display time `t`: on a time column the one with
+    /// the nearest stamp, never an interpolation; inside a hole, the nearer
+    /// sample either side of it. `None` before the first sample or after the
+    /// last by more than an interval.
+    pub fn nearest(&self, t: f64) -> Option<Reading> {
+        let n = self.len();
+        let local = self.placement.local(t);
+        let after = self.index_at(local);
+        let index = match (after.checked_sub(1), after < n) {
+            (Some(before), true) => {
+                if local - self.local_time(before) <= self.local_time(after) - local {
+                    before
+                } else {
+                    after
+                }
+            }
+            (Some(before), false) => before,
+            (None, true) => after,
+            (None, false) => return None,
+        };
+        let at = self.local_time(index);
+        let outside = after == 0 || after == n;
+        if outside && (local - at).abs() > (1.0 + EPS) / self.rate_hz() {
+            return None;
+        }
+        let stamp = match &self.clock {
+            Clock::Stamped { time, .. } => time.get_i64(index),
+            Clock::Fixed { .. } => None,
+        };
+        let single = matches!(&self.values, Values::Column(c) if c.dtype() == Dtype::F32);
+        Some(Reading {
+            index,
+            time: self.placement.display(at),
+            value: self.gain * self.value(index) + self.offset,
+            stamp,
+            single,
+        })
+    }
+
     /// The UTC instant, in ns since the Unix epoch, at display time `t` on
     /// this stream's clock; `None` without a time column and an anchor.
     pub fn utc_ns_at(&self, t: f64) -> Option<i64> {
@@ -443,7 +520,7 @@ impl Trace {
 mod tests {
     use super::*;
     use sigkit_format::Channel;
-    use sigkit_format::{ClockDomain, Column, Dtype, Header, Recording, Stream, StreamData};
+    use sigkit_format::{ClockDomain, Column, Header, Recording, Stream, StreamData};
 
     /// 1000 samples at 100 Hz, sample `i` holds the value `i`.
     fn ramp(dir: &std::path::Path, gain: f64, offset: f64) -> Trace {
@@ -750,6 +827,84 @@ mod tests {
         assert_eq!(trace.utc_ns_at(2.75), Some(noon + 1_500_000_000));
         let unanchored = trace.anchored(None);
         assert_eq!(unanchored.utc_ns_at(2.25), None);
+    }
+
+    #[test]
+    fn the_reading_at_an_instant_is_the_nearest_sample_exactly_as_stored_after_calibration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = ramp(&tmp.path().join("r.sigrec"), -2.0, 1.0);
+        let r = trace.nearest(0.123).unwrap();
+        assert_eq!((r.index, r.time, r.value, r.stamp), (12, 0.12, -23.0, None));
+        assert_eq!(trace.nearest(0.126).unwrap().index, 13);
+        assert_eq!(trace.nearest(-0.004).unwrap().index, 0);
+        assert_eq!(trace.nearest(10.0).unwrap().index, 999);
+        // More than an interval outside the signal: no sample is near.
+        assert!(trace.nearest(-0.02).is_none() && trace.nearest(10.02).is_none());
+    }
+
+    #[test]
+    fn the_reading_on_a_time_column_is_the_sample_with_the_nearest_stamp_and_carries_the_raw_stamp()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let (trace, stamps) = stamped(&tmp.path().join("t.sigrec"), 2000, jittered);
+        let trace = trace.placed(Placement {
+            start_s: 1.0,
+            k: 1.0,
+            shift_s: 0.5,
+        });
+        let local = |i: usize| (stamps[i] - stamps[0]) as f64 * 1e-9;
+        for t in [1.5, 1.5031, 4.2049, 7.777, 21.48] {
+            let closest = (0..stamps.len())
+                .min_by(|&a, &b| {
+                    let d = |i| (local(i) + 1.5 - t).abs();
+                    d(a).total_cmp(&d(b))
+                })
+                .unwrap();
+            let r = trace.nearest(t).unwrap();
+            assert_eq!(r.index, closest, "at {t}");
+            assert_eq!(r.value, closest as f64);
+            assert_eq!(r.stamp, Some(stamps[closest]));
+            assert!((r.time - (local(closest) + 1.5)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn inside_a_hole_the_reading_is_the_nearest_real_sample_either_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 100 Hz with samples 50..=54 dropped: a hole from 0.49 s to 0.55 s.
+        let (trace, _) = stamped(&tmp.path().join("t.sigrec"), 100, |i| {
+            let i = if i >= 50 { i + 5 } else { i } as i64;
+            i * 10_000_000
+        });
+        assert_eq!(trace.nearest(0.51).unwrap().index, 49);
+        assert_eq!(trace.nearest(0.53).unwrap().index, 50);
+        assert_eq!(trace.nearest(0.53).unwrap().time, 0.55);
+    }
+
+    #[test]
+    fn a_reading_prints_as_the_stored_sample_and_nothing_more() {
+        let single = |value: f64| Reading {
+            index: 0,
+            time: 0.0,
+            value,
+            stamp: None,
+            single: true,
+        };
+        let double = |value: f64| Reading {
+            single: false,
+            ..single(value)
+        };
+        // An f32 sample, as stored and after calibration in f64.
+        assert_eq!(single(0.1f32 as f64).value_text(), "0.1");
+        assert_eq!(single(2.0 * 0.1f32 as f64 + 1.0).value_text(), "1.2");
+        assert_eq!(single(9.81f32 as f64).value_text(), "9.81");
+        // Wider samples keep 15 significant digits, enough to tell any two
+        // apart, and lose the noise of the calibration's arithmetic.
+        assert_eq!(double(0.1 + 0.2).value_text(), "0.3");
+        assert_eq!(double(0.001 * 1234.0).value_text(), "1.234");
+        assert_eq!(double(123456789012.0).value_text(), "123456789012");
+        assert_eq!(double(-0.0).value_text(), "0");
+        assert_eq!(double(1e-7 / 3.0).value_text(), "3.33333333333333e-8");
     }
 
     #[test]

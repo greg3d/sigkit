@@ -4,6 +4,7 @@
 //! 150 ms. Both are pure functions of time, so a frame drawn late lands where
 //! it should and nothing accumulates rounding.
 
+use crate::layout::Views;
 use crate::view::View;
 use egui::Vec2;
 
@@ -97,17 +98,35 @@ impl Inertia {
     }
 }
 
+/// What a [`Tween`] can ease: anything with a straight line between two
+/// values of it.
+pub trait Ease: Clone {
+    fn lerp(a: &Self, b: &Self, u: f64) -> Self;
+}
+
+impl Ease for Views {
+    fn lerp(a: &Views, b: &Views, u: f64) -> Views {
+        Views::lerp(a, b, u)
+    }
+}
+
+impl Ease for View {
+    fn lerp(a: &View, b: &View, u: f64) -> View {
+        View::lerp(*a, *b, u)
+    }
+}
+
 /// A view easing from where it was to a target, interruptible: whoever
 /// interrupts takes [`Tween::at`] as the current view and drops the tween.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Tween {
-    from: View,
-    to: View,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tween<T> {
+    from: T,
+    to: T,
     started: f64,
 }
 
-impl Tween {
-    pub fn new(from: View, to: View, now: f64) -> Tween {
+impl<T: Ease> Tween<T> {
+    pub fn new(from: T, to: T, now: f64) -> Tween<T> {
         Tween {
             from,
             to,
@@ -115,18 +134,18 @@ impl Tween {
         }
     }
 
-    pub fn target(&self) -> View {
-        self.to
+    pub fn target(&self) -> &T {
+        &self.to
     }
 
     /// The view at `now`: ease-out cubic from `from` to `to`, exactly `to`
     /// from [`ANIMATION_S`] on.
-    pub fn at(&self, now: f64) -> View {
+    pub fn at(&self, now: f64) -> T {
         if self.is_done(now) {
-            return self.to;
+            return self.to.clone();
         }
         let u = ((now - self.started) / ANIMATION_S).max(0.0);
-        View::lerp(self.from, self.to, 1.0 - (1.0 - u).powi(3))
+        T::lerp(&self.from, &self.to, 1.0 - (1.0 - u).powi(3))
     }
 
     pub fn is_done(&self, now: f64) -> bool {

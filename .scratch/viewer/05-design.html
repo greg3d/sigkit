@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ticket 05 layout draft</title>
+<style>
+:root {
+  --page: #ececec; --bg: #ffffff; --chrome: #f6f6f6; --line: #e2e2e2; --text: #1a1a1a;
+  --weak: #6e6e6e; --grid: #e6e6e6; --pill: rgba(255,255,255,.85); --hover: rgba(0,0,0,.05);
+  --sel: #cfe3ff; --cursor: #8a8a8a; --remove: #d1495b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0c0c0c; --bg: #161616; --chrome: #1e1e1e; --line: #2e2e2e; --text: #e6e6e6;
+    --weak: #969696; --grid: #2c2c2c; --pill: rgba(22,22,22,.85); --hover: rgba(255,255,255,.06);
+    --sel: #1d3a66; --cursor: #7a7a7a; --remove: #f07a8a;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0c0c0c; --bg: #161616; --chrome: #1e1e1e; --line: #2e2e2e; --text: #e6e6e6;
+  --weak: #969696; --grid: #2c2c2c; --pill: rgba(22,22,22,.85); --hover: rgba(255,255,255,.06);
+  --sel: #1d3a66; --cursor: #7a7a7a; --remove: #f07a8a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: var(--page); color: var(--text);
+  font: 13px/1.45 Inter, -apple-system, system-ui, sans-serif; }
+.mock { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 auto 10px; max-width: 1240px;
+  padding: 8px 10px; border: 1px dashed var(--weak); border-radius: 8px; color: var(--weak); }
+.mock b { color: var(--text); font-weight: 600; margin-right: 4px; }
+.mock button { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+.mock button:hover { background: var(--chrome); }
+.mock .sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+
+.app { display: grid; grid-template-columns: 260px 1fr; height: 680px; max-width: 1240px; margin: 0 auto;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--bg); }
+
+/* Sidebar tree */
+.sidebar { position: relative; background: var(--chrome); border-right: 1px solid var(--line);
+  overflow-y: auto; padding: 8px 0 40px; user-select: none; }
+.sidebar h2 { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--weak); margin: 4px 14px 6px; }
+.row { display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 0; white-space: nowrap; }
+.row .tw { width: 14px; text-align: center; color: var(--weak); font-size: 10px; flex: none; }
+.rec { padding-left: 6px; font-weight: 600; margin-top: 6px; }
+.rec .meta { font-weight: 400; }
+.stream { padding-left: 18px; }
+.meta { color: var(--weak); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; }
+.fit { padding: 0 10px 3px 52px; color: var(--weak); font-size: 11px; line-height: 1.35; white-space: normal; }
+.ch { padding-left: 34px; border-radius: 5px; margin: 0 6px; cursor: grab; }
+.ch:hover { background: var(--hover); }
+.ch .id { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.ch.residual .id { font-style: italic; }
+.ch .count { color: var(--weak); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid currentColor; flex: none; }
+.dot.on { background: currentColor; }
+.toggle { font-size: 10.5px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--line);
+  color: var(--weak); cursor: pointer; }
+.toggle.on { background: var(--sel); color: var(--text); border-color: transparent; }
+.sidebar .foot { position: absolute; left: 14px; right: 14px; bottom: 10px; color: var(--weak); font-size: 11px; }
+.sidebar.remove::after { content: "drop to remove from its panel"; position: absolute; inset: 6px;
+  border: 2px dashed var(--remove); border-radius: 8px; display: grid; place-items: center;
+  color: var(--remove); font-weight: 600; background: color-mix(in srgb, var(--remove) 8%, transparent); }
+
+/* Plot area */
+main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0; }
+.plots { position: relative; display: flex; min-height: 0; }
+.plots.vertical { flex-direction: row; }
+.plots.horizontal { flex-direction: column; }
+.panel { position: relative; flex: 1 1 0; min-width: 0; min-height: 0; }
+.plots.vertical .panel + .panel { border-left: 1px solid var(--line); }
+.plots.horizontal .panel + .panel { border-top: 1px solid var(--line); }
+.panel canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.empty { flex: 1; display: grid; place-items: center; color: var(--weak); }
+
+.legend { position: absolute; right: 8px; display: flex; flex-direction: column; gap: 4px; align-items: flex-end; }
+.plots.vertical .legend { bottom: 8px; }
+.plots.horizontal .legend { top: 8px; }
+.chip { background: var(--pill); border-radius: 6px; padding: 3px 8px; cursor: grab; max-width: 100%;
+  backdrop-filter: blur(2px); }
+.chip:hover { background: var(--chrome); }
+.chip .name { display: flex; align-items: center; gap: 6px; color: var(--weak); font-size: 12px; white-space: nowrap; }
+.chip .swatch { width: 14px; height: 2px; flex: none; }
+.chip .val { font: 11.5px/1.35 ui-monospace, "SF Mono", Menlo, monospace; color: var(--text);
+  white-space: nowrap; padding-left: 20px; font-variant-numeric: tabular-nums; }
+.chip .val .stamp { color: var(--weak); }
+
+.drop { position: absolute; pointer-events: none; display: none; z-index: 5; }
+.drop.overlay { border: 2px dashed var(--c); border-radius: 6px; background: color-mix(in srgb, var(--c) 10%, transparent); }
+.drop.insert { background: var(--c); border-radius: 2px; }
+.drop .tag { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); white-space: nowrap;
+  background: var(--c); color: #fff; font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 9px; }
+
+/* Bottom bar, as today minus the channel picker */
+.bar { background: var(--chrome); border-top: 1px solid var(--line); padding: 5px 10px 4px; }
+.bar .line1 { display: flex; align-items: center; gap: 10px; }
+.seg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); }
+.seg span { padding: 1px 8px; border-radius: 5px; cursor: pointer; }
+.seg span.on { background: var(--sel); }
+.bar .readout { margin-left: auto; font: 12px ui-monospace, "SF Mono", Menlo, monospace; }
+.bar .weak { color: var(--weak); font-size: 12px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.notes { max-width: 1240px; margin: 14px auto 0; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.notes section { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 16px; }
+.notes h3 { margin: 4px 0 6px; font-size: 13px; }
+.notes ol, .notes ul { margin: 0; padding-left: 20px; }
+.notes li { margin: 3px 0; }
+.notes code { font-size: 12px; }
+@media (max-width: 800px) { .app { grid-template-columns: 1fr; height: auto; } .sidebar { max-height: 260px; }
+  .plots { height: 460px; } .notes { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<div class="mock">
+  <b>Mock controls</b>
+  <button data-preset="one">One recording</button>
+  <button data-preset="pair">Pair side by side</button>
+  <button data-preset="overlay">Overlay + alone</button>
+  <span class="sep"></span>
+  <button id="drop-b">Drop pair-b.sigrec on the window</button>
+  <span class="sep"></span>
+  <button id="orient">Orientation (O)</button>
+  <button id="theme">Theme: system</button>
+  <span style="margin-left:auto">Drag tree rows and legend chips. Hover a plot for the cursor. Wheel zooms time, drag pans.</span>
+</div>
+
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main>
+    <div class="plots vertical" id="plots"><div class="drop" id="drop"><span class="tag"></span></div></div>
+    <div class="bar">
+      <div class="line1">
+        <div class="seg"><span class="on">Pan&nbsp; 1</span><span>Align&nbsp; 2</span><span>Box&nbsp; 3</span></div>
+        <div class="readout" id="readout"></div>
+      </div>
+      <div class="weak" id="status"></div>
+      <div class="weak">drag a channel onto a panel to overlay, between panels for a new one  ·  drag a legend to another panel to move it, to the tree to remove it  ·  pinch or +/− zoom time  ·  ⇧ value  ·  A or double-click fit  ·  O orientation</div>
+    </div>
+  </main>
+</div>
+
+<div class="notes">
+  <section>
+    <h3>What this draft proposes</h3>
+    <ol>
+      <li><b>Sidebar on the left</b>, about 260 px wide, always visible. It lists recording → stream → channel. A dot shows each channel's palette colour: filled when the channel is on a panel, hollow when not. A count shows how many panels it is on.</li>
+      <li><b>The fit readout and the <i>fit</i> toggle move into the tree.</b> They sit under each timestamped stream and on its residual row. The bottom bar's channel picker goes away.</li>
+      <li><b>One time view for all panels</b>, each panel with its own value view. Panels sit side by side in vertical mode and stacked in horizontal mode. Only the first panel draws time labels (the last one in horizontal mode). Every panel draws its own value labels.</li>
+      <li><b>Drop targets:</b> a dashed outline in the channel's colour over a panel means <i>overlay</i>. A bar on a panel edge (within 22 px) means <i>new panel</i>. The tree tints red when a legend is dragged onto it, meaning <i>remove</i>. A panel disappears with its last channel.</li>
+      <li><b>Legend chips are the drag handle</b> for channels already on a panel: drag one to another panel to move it, or to a panel edge to split it out.</li>
+      <li><b>Cursor:</b> one line across every panel, with a dot on each channel's nearest sample. Each legend chip gains a second line showing the exact value and unit, then the raw stamp in clock units for timestamped streams. The bottom bar shows <code>t</code>, plus UTC for each recording that has an anchor.</li>
+      <li><b>Dropping a second recording</b> adds it to the tree. It also opens a new panel with the channel matching the first panel's first channel, which is how the <code>pair</code> preset ends up side by side.</li>
+      <li>A channel can be on several panels, but only once per panel. That is what makes "overlaid here, alone there" in the acceptance criteria possible.</li>
+    </ol>
+  </section>
+  <section>
+    <h3>Open questions</h3>
+    <ul>
+      <li><b>Palette with two recordings.</b> The glossary colours channels "by their place in the recording", so <code>pair-a accel/z</code> and <code>pair-b accel/z</code> would get the same colour on an overlay. The draft numbers colours across all open recordings in tree order instead.</li>
+      <li><b>Mixed units on one panel</b>, such as m/s² over a ms residual. The draft allows it, and the value labels drop the unit when the units differ.</li>
+      <li><b>Autoscale scope.</b> <code>A</code> would fit the panel under the pointer and <code>⇧A</code> every panel. Alternatively <code>A</code> fits every panel.</li>
+      <li><b>Readout precision.</b> The draft prints a value at the precision of its column's dtype after gain and offset: 7 significant digits for f32, 15 for f64, and the integer times gain for integer types.</li>
+      <li><b>Sidebar width:</b> fixed, or resizable with a drag handle?</li>
+    </ul>
+  </section>
+</div>
+
+<script>
+const PALETTE = [["#1f6feb","#6cb4f5"],["#d1495b","#f07a8a"],["#1f8a7e","#5cc8b8"],["#c97c10","#f2bf63"],
+                 ["#7a55d6","#b39cf0"],["#348a47","#6cc47e"],["#b84a78","#e889ad"],["#52606e","#9aa8b6"]];
+const TAU = Math.PI * 2;
+
+// Deterministic noise in [-1, 1].
+function noise(i, seed) {
+  let h = (i * 374761393 + seed * 668265263) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 2147483648 - 1;
+}
+
+// Two recordings of one physical signal on two drifting clocks, the second shifted (the `pair` preset).
+function makeRecording(name, seed, shift, ppm, monoZero, utcZero) {
+  const sig = {
+    x: t => 0.8 * Math.sin(TAU * 0.7 * t),
+    y: t => 0.5 * Math.sin(TAU * 0.23 * t + 1),
+    z: t => 9.81 + 1.2 * Math.sin(TAU * 0.5 * t),
+  };
+  const accel = { id: "accel", kind: "timestamped", rate: 416, unit: "ns", ppm, monoZero, utcZero,
+    fit: `fitted ${(416 * (1 + ppm * 1e-6)).toFixed(4)} Hz · ${ppm >= 0 ? "+" : "−"}${Math.abs(ppm).toFixed(2)} ± 0.02 ppm · ${seed === 1 ? 116 : 98} missing`,
+    channels: [
+      { id: "x", unit: "m/s²", dtype: "f32", f: (t, i) => sig.x(t - shift) + 0.12 * noise(i, seed) },
+      { id: "y", unit: "m/s²", dtype: "f32", f: (t, i) => sig.y(t - shift) + 0.08 * noise(i, seed + 7) },
+      { id: "z", unit: "m/s²", dtype: "f32", f: (t, i) => sig.z(t - shift) + 0.1 * noise(i, seed + 3) },
+      { id: "residual", unit: "ms", dtype: "f64", residual: true, subtractFit: false,
+        f: (t, i) => ppm * 1e-3 * t + 0.25 * noise(i, seed + 11) + 2.404 * Math.floor((t + seed) / 3.7) },
+    ] };
+  const streams = [accel];
+  if (seed === 1) streams.push({ id: "baro", kind: "fixed_rate", rate: 25, channels: [
+    { id: "p", unit: "hPa", dtype: "i32", f: (t, i) => 1013.2 + 0.3 * Math.sin(TAU * 0.05 * t) + 0.02 * noise(i, 5) } ] });
+  return { name, streams };
+}
+const A = makeRecording("pair-a", 1, 0, 50, 123456789012, Date.UTC(2026, 9, 29, 12, 0, 0));
+const B = makeRecording("pair-b", 2, 0.37, -50, 98765432100, null);
+
+const state = { recordings: [A], panels: [], orientation: "vertical", time: [0, 12], cursor: null,
+  collapsed: new Set(), theme: "system" };
+
+// Every channel of every open recording, in tree order. The palette index is its place in that order.
+function allChannels() {
+  const out = [];
+  state.recordings.forEach((r, ri) => r.streams.forEach(s => s.channels.forEach(c =>
+    out.push({ key: `${r.name}:${s.id}/${c.id}`, rec: r, ri, stream: s, ch: c }))));
+  out.forEach((c, i) => c.color = i);
+  return out;
+}
+const byKey = k => allChannels().find(c => c.key === k);
+const isDark = () => state.theme === "dark" || (state.theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+const colorOf = c => PALETTE[c.color % PALETTE.length][isDark() ? 1 : 0];
+const label = c => (state.recordings.length > 1 ? `${c.rec.name} · ` : "") + `${c.stream.id}/${c.ch.id}`;
+
+function presets(name) {
+  state.time = [0, 12];
+  if (name === "one") { state.recordings = [A]; state.panels = [["pair-a:accel/z"]]; }
+  if (name === "pair") { state.recordings = [A, B]; state.panels = [["pair-a:accel/z"], ["pair-b:accel/z"]]; }
+  if (name === "overlay") { state.recordings = [A, B];
+    state.panels = [["pair-a:accel/z", "pair-b:accel/z"], ["pair-a:accel/z"], ["pair-a:accel/residual"]]; }
+  layout();
+}
+
+// ---------- Sidebar ----------
+const sidebar = document.getElementById("sidebar");
+function renderTree() {
+  const chans = allChannels();
+  const count = k => state.panels.filter(p => p.includes(k)).length;
+  let html = `<h2>Recordings</h2>`;
+  state.recordings.forEach(r => {
+    const rc = state.collapsed.has(r.name);
+    html += `<div class="row rec" data-toggle="${r.name}"><span class="tw">${rc ? "▸" : "▾"}</span>${r.name}<span class="meta">.sigrec</span></div>`;
+    if (rc) return;
+    r.streams.forEach(s => {
+      const kind = s.kind === "timestamped" ? `timestamped · ${s.rate} Hz nominal` : `fixed · ${s.rate} Hz`;
+      html += `<div class="row stream"><span class="tw">▾</span>${s.id}<span class="meta">${kind}</span></div>`;
+      if (s.fit) html += `<div class="fit">${s.fit}</div>`;
+      s.channels.forEach(c => {
+        const info = chans.find(x => x.rec === r && x.stream === s && x.ch === c);
+        const n = count(info.key);
+        html += `<div class="row ch${c.residual ? " residual" : ""}" draggable="true" data-key="${info.key}">
+          <span class="dot${n ? " on" : ""}" style="color:${colorOf(info)}"></span>
+          <span class="id">${c.id}</span>
+          ${c.residual ? `<span class="toggle${c.subtractFit ? " on" : ""}" data-fit="${info.key}" title="subtract fitted rate">fit</span>` : ""}
+          <span class="meta">${c.unit}</span>
+          <span class="count">${n > 1 ? "×" + n : ""}</span></div>`;
+      });
+    });
+  });
+  html += `<div class="foot">drag a channel onto the plot · drop a .sigrec on the window to add it</div>`;
+  sidebar.innerHTML = html;
+}
+sidebar.addEventListener("click", e => {
+  const t = e.target.closest("[data-toggle]");
+  if (t) { const n = t.dataset.toggle; state.collapsed.has(n) ? state.collapsed.delete(n) : state.collapsed.add(n); renderTree(); }
+  const f = e.target.closest("[data-fit]");
+  if (f) { const c = byKey(f.dataset.fit).ch; c.subtractFit = !c.subtractFit; renderTree(); draw(); }
+});
+
+// ---------- Panels ----------
+const plots = document.getElementById("plots");
+const dropEl = document.getElementById("drop");
+function layout() {
+  plots.className = `plots ${state.orientation}`;
+  [...plots.querySelectorAll(".panel, .empty")].forEach(n => n.remove());
+  if (!state.panels.length) {
+    const e = document.createElement("div"); e.className = "empty"; e.textContent = "drag a channel here";
+    plots.insertBefore(e, dropEl);
+  }
+  state.panels.forEach((keys, pi) => {
+    const p = document.createElement("div"); p.className = "panel"; p.dataset.panel = pi;
+    p.innerHTML = `<canvas></canvas><div class="legend"></div>`;
+    const lg = p.querySelector(".legend");
+    keys.forEach(k => {
+      const c = byKey(k);
+      const chip = document.createElement("div"); chip.className = "chip"; chip.draggable = true;
+      chip.dataset.key = k; chip.dataset.from = pi;
+      chip.innerHTML = `<div class="name"><span class="swatch" style="background:${colorOf(c)}"></span>${label(c)}</div><div class="val"></div>`;
+      lg.appendChild(chip);
+    });
+    plots.insertBefore(p, dropEl);
+  });
+  renderTree(); draw();
+}
+
+// 1-2-5 ticks.
+function ticks(lo, hi, px, minPx) {
+  const raw = (hi - lo) / Math.max(1, Math.floor(px / minPx));
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map(m => m * mag).find(s => s >= raw);
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(+v.toPrecision(12));
+  return out;
+}
+// Sample i of a channel: its display time and its value.
+function sampleAt(c, i) {
+  const s = c.stream, jit = s.kind === "timestamped" ? 0.00018 * noise(i, 99) : 0;
+  const t = i / s.rate * (1 + (s.ppm || 0) * 1e-6) + jit;
+  return { t, v: c.ch.f(t, i) * (c.ch.subtractFit ? 0.1 : 1) };
+}
+const nearestIndex = (c, t) => Math.max(0, Math.round(t * c.stream.rate));
+function fmtValue(c, v) {
+  if (c.ch.dtype === "i32") return (Math.round(v * 100) / 100).toFixed(2);
+  return (+v.toPrecision(c.ch.dtype === "f64" ? 10 : 7)).toString();
+}
+// Min and max per pixel along time: candles.
+function candles(c, along) {
+  const [t0, t1] = state.time, out = [];
+  for (let p = 0; p < along; p++) {
+    const ta = t0 + (t1 - t0) * p / along, tb = t0 + (t1 - t0) * (p + 1) / along;
+    const ia = Math.ceil(ta * c.stream.rate), ib = Math.floor(tb * c.stream.rate);
+    let lo = Infinity, hi = -Infinity;
+    const step = Math.max(1, Math.floor((ib - ia) / 24));
+    for (let i = Math.max(0, ia); i <= ib; i += step) { const v = sampleAt(c, i).v; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    if (lo === Infinity) { const v = sampleAt(c, Math.max(0, Math.round(ta * c.stream.rate))).v; lo = hi = v; }
+    out.push([lo, hi]);
+  }
+  return out;
+}
+
+function draw() {
+  const css = getComputedStyle(document.documentElement), cv = n => css.getPropertyValue(n).trim();
+  const [t0, t1] = state.time, vert = state.orientation === "vertical";
+  const panels = [...plots.querySelectorAll(".panel")];
+  panels.forEach((el, pi) => {
+    const canvas = el.querySelector("canvas"), dpr = devicePixelRatio || 1;
+    const w = el.clientWidth, h = el.clientHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const g = canvas.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.fillStyle = cv("--bg"); g.fillRect(0, 0, w, h);
+    const along = vert ? h : w, across = vert ? w : h;
+    const chans = state.panels[pi].map(byKey);
+    const series = chans.map(c => ({ c, bins: candles(c, Math.ceil(along)) }));
+    // One value axis per panel, fitted to its channels in view.
+    let lo = Infinity, hi = -Infinity;
+    series.forEach(s => s.bins.forEach(([a, b]) => { lo = Math.min(lo, a); hi = Math.max(hi, b); }));
+    const pad = (hi - lo) * 0.06 || 1; lo -= pad; hi += pad;
+    const A = t => (t - t0) / (t1 - t0) * along, C = v => (v - lo) / (hi - lo) * across;
+    const pt = (a, c) => vert ? [c, a] : [a, across - c];
+    g.font = "11px Inter, -apple-system, system-ui, sans-serif"; g.lineWidth = 1;
+    const pill = (text, x, y, align) => {
+      const tw = g.measureText(text).width;
+      const x0 = align === "left" ? x : align === "right" ? x - tw : x - tw / 2;
+      g.fillStyle = cv("--pill"); g.beginPath(); g.roundRect(x0 - 4, y - 8, tw + 8, 16, 5); g.fill();
+      g.fillStyle = cv("--weak"); g.textBaseline = "middle"; g.fillText(text, x0, y);
+    };
+    // Grid.
+    g.strokeStyle = cv("--grid");
+    const tt = ticks(t0, t1, along, 90), vt = ticks(lo, hi, across, 60);
+    g.beginPath();
+    tt.forEach(t => { const a = Math.round(A(t)) + .5; const [x1, y1] = pt(a, 0), [x2, y2] = pt(a, across); g.moveTo(x1, y1); g.lineTo(x2, y2); });
+    vt.forEach(v => { const c = Math.round(C(v)) + .5; const [x1, y1] = pt(0, c), [x2, y2] = pt(along, c); g.moveTo(x1, y1); g.lineTo(x2, y2); });
+    g.stroke();
+    // Traces as candles.
+    series.forEach(({ c, bins }) => {
+      g.strokeStyle = colorOf(c); g.beginPath();
+      bins.forEach(([a, b], p) => { const [x1, y1] = pt(p + .5, C(a)), [x2, y2] = pt(p + .5, C(b)); p ? g.lineTo(x1, y1) : g.moveTo(x1, y1); g.lineTo(x2, y2); });
+      g.stroke();
+    });
+    // Labels: time on the first (vertical) or last (horizontal) panel, values on every panel.
+    const units = [...new Set(chans.map(c => c.ch.unit))], unit = units.length === 1 ? " " + units[0] : "";
+    const timePanel = vert ? 0 : panels.length - 1;
+    if (pi === timePanel) tt.forEach(t => { const [x, y] = pt(A(t), 0); vert ? pill(`${t} s`, 6, y + 9, "left") : pill(`${t} s`, x, h - 10, "center"); });
+    vt.forEach((v, i) => { const [x, y] = pt(0, C(v)); const s = (+v.toPrecision(6)) + (i === vt.length - 1 ? unit : "");
+      vert ? pill(s, x, 10, "center") : pill(s, 6 + 30, y, "left"); });
+    // Cursor: one line through every panel, a dot on each channel's nearest sample.
+    const vals = el.querySelectorAll(".chip .val");
+    if (state.cursor !== null) {
+      const a = A(state.cursor);
+      g.strokeStyle = cv("--cursor"); g.setLineDash([3, 3]); g.beginPath();
+      const [x1, y1] = pt(a, 0), [x2, y2] = pt(a, across); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke(); g.setLineDash([]);
+      chans.forEach((c, ci) => {
+        const i = nearestIndex(c, state.cursor), s = sampleAt(c, i);
+        const [x, y] = pt(A(s.t), C(s.v));
+        g.fillStyle = cv("--bg"); g.strokeStyle = colorOf(c); g.lineWidth = 1.5;
+        g.beginPath(); g.arc(x, y, 3.5, 0, TAU); g.fill(); g.stroke(); g.lineWidth = 1;
+        const stamp = c.stream.kind === "timestamped"
+          ? `<br><span class="stamp">${Math.round(c.stream.monoZero + s.t * 1e9)} ns</span>` : "";
+        vals[ci].innerHTML = `${fmtValue(c, s.v)} ${c.ch.unit}${stamp}`;
+        vals[ci].style.display = "";
+      });
+      if (pi === timePanel) { const [x, y] = pt(a, 0); vert ? pill(`${state.cursor.toFixed(4)} s`, 6, y, "left") : pill(`${state.cursor.toFixed(4)} s`, x, h - 26, "center"); }
+    } else vals.forEach(v => v.style.display = "none");
+  });
+  // Bottom bar.
+  const ro = document.getElementById("readout");
+  if (state.cursor === null) ro.textContent = "";
+  else {
+    let s = `t ${state.cursor.toFixed(4)} s`;
+    state.recordings.forEach(r => { const z = r.streams[0].utcZero;
+      if (z) s += `  ·  ${state.recordings.length > 1 ? r.name + " " : ""}UTC ${new Date(z + state.cursor * 1e3).toISOString().replace("Z", "")}Z`; });
+    ro.textContent = s;
+  }
+  const plotted = new Set(state.panels.flat()).size;
+  document.getElementById("status").textContent =
+    `${state.recordings.map(r => r.name).join(", ")}  ·  ${state.panels.length} panel${state.panels.length === 1 ? "" : "s"}  ·  ${plotted} channel${plotted === 1 ? "" : "s"} on them  ·  plot 3.2 ms`;
+}
+
+// ---------- Cursor, zoom and pan ----------
+function timeAt(e) {
+  const p = e.target.closest(".panel"); if (!p) return null;
+  const r = p.getBoundingClientRect(), [t0, t1] = state.time;
+  const f = state.orientation === "vertical" ? (e.clientY - r.top) / r.height : (e.clientX - r.left) / r.width;
+  return t0 + f * (t1 - t0);
+}
+let pan = null;
+plots.addEventListener("mousemove", e => {
+  if (pan) { const p = pan.panel.getBoundingClientRect(), vert = state.orientation === "vertical";
+    const d = (vert ? e.clientY - pan.y : e.clientX - pan.x) / (vert ? p.height : p.width) * (pan.t[1] - pan.t[0]);
+    state.time = [pan.t[0] - d, pan.t[1] - d]; }
+  state.cursor = timeAt(e); draw();
+});
+plots.addEventListener("mouseleave", () => { state.cursor = null; pan = null; draw(); });
+plots.addEventListener("mousedown", e => { const p = e.target.closest(".panel");
+  if (p && !e.target.closest(".chip")) { pan = { panel: p, x: e.clientX, y: e.clientY, t: [...state.time] }; e.preventDefault(); } });
+addEventListener("mouseup", () => pan = null);
+plots.addEventListener("wheel", e => { const t = timeAt(e); if (t === null) return; e.preventDefault();
+  const k = Math.exp(e.deltaY * 0.002), [t0, t1] = state.time;
+  state.time = [t - (t - t0) * k, t + (t1 - t) * k]; state.cursor = t; draw(); }, { passive: false });
+
+// ---------- Drag and drop ----------
+let dragging = null; // { key, from: panel index | null }
+document.addEventListener("dragstart", e => {
+  const el = e.target.closest("[draggable=true]"); if (!el) return;
+  dragging = { key: el.dataset.key, from: el.dataset.from === undefined ? null : +el.dataset.from };
+  e.dataTransfer.setData("text/plain", dragging.key); e.dataTransfer.effectAllowed = "move";
+});
+document.addEventListener("dragend", () => { dragging = null; hideDrop(); sidebar.classList.remove("remove"); });
+function hideDrop() { dropEl.style.display = "none"; }
+
+// Where a drop at the pointer lands: a new panel at an index, or an overlay on a panel.
+function target(e) {
+  const box = plots.getBoundingClientRect(), vert = state.orientation === "vertical";
+  const pos = vert ? e.clientX - box.left : e.clientY - box.top;
+  const rects = [...plots.querySelectorAll(".panel")].map(p => { const r = p.getBoundingClientRect();
+    return vert ? [r.left - box.left, r.right - box.left] : [r.top - box.top, r.bottom - box.top]; });
+  if (!rects.length) return { insert: 0, at: 0, whole: true };
+  const edges = [rects[0][0], ...rects.map(r => r[1])];
+  const k = edges.findIndex(b => Math.abs(pos - b) < 22);
+  if (k >= 0) return { insert: k, at: edges[k] };
+  const pi = rects.findIndex(r => pos >= r[0] && pos < r[1]);
+  return pi >= 0 ? { overlay: pi, rect: rects[pi] } : null;
+}
+plots.addEventListener("dragover", e => {
+  if (!dragging) return; e.preventDefault(); sidebar.classList.remove("remove");
+  const t = target(e), vert = state.orientation === "vertical", c = byKey(dragging.key);
+  if (!t) return hideDrop();
+  const box = plots.getBoundingClientRect(), tag = dropEl.querySelector(".tag");
+  dropEl.style.setProperty("--c", colorOf(c)); dropEl.style.display = "block";
+  const place = (a0, a1) => vert
+    ? Object.assign(dropEl.style, { left: a0 + "px", width: a1 - a0 + "px", top: "4px", height: box.height - 8 + "px" })
+    : Object.assign(dropEl.style, { top: a0 + "px", height: a1 - a0 + "px", left: "4px", width: box.width - 8 + "px" });
+  if (t.whole) { dropEl.className = "drop overlay"; place(4, (vert ? box.width : box.height) - 4); tag.textContent = "new panel"; }
+  else if (t.insert !== undefined) { dropEl.className = "drop insert"; const a = Math.min(Math.max(t.at, 2), (vert ? box.width : box.height) - 2); place(a - 2, a + 2); tag.textContent = "new panel"; }
+  else { dropEl.className = "drop overlay"; place(t.rect[0] + 4, t.rect[1] - 4);
+    tag.textContent = state.panels[t.overlay].includes(dragging.key) ? "already on this panel" : "overlay"; }
+});
+plots.addEventListener("dragleave", e => { if (!plots.contains(e.relatedTarget)) hideDrop(); });
+plots.addEventListener("drop", e => {
+  e.preventDefault(); if (!dragging) return;
+  const t = target(e), { key, from } = dragging;
+  if (!t) return;
+  let panels = state.panels.map(p => [...p]);
+  const take = () => { if (from !== null) panels[from] = panels[from].filter(k => k !== key); };
+  if (t.overlay !== undefined) {
+    if (panels[t.overlay].includes(key)) return hideDrop();
+    take(); panels[t.overlay].push(key);
+  } else {
+    take(); panels.splice(t.insert, 0, [key]);
+  }
+  state.panels = panels.filter(p => p.length); hideDrop(); layout();
+});
+sidebar.addEventListener("dragover", e => { if (dragging && dragging.from !== null) { e.preventDefault(); sidebar.classList.add("remove"); hideDrop(); } });
+sidebar.addEventListener("dragleave", e => { if (!sidebar.contains(e.relatedTarget)) sidebar.classList.remove("remove"); });
+sidebar.addEventListener("drop", e => {
+  e.preventDefault(); sidebar.classList.remove("remove"); if (!dragging || dragging.from === null) return;
+  const { key, from } = dragging;
+  state.panels = state.panels.map((p, i) => i === from ? p.filter(k => k !== key) : p).filter(p => p.length); layout();
+});
+
+// ---------- Mock controls ----------
+document.querySelectorAll("[data-preset]").forEach(b => b.onclick = () => presets(b.dataset.preset));
+document.getElementById("drop-b").onclick = () => {
+  if (state.recordings.includes(B)) return;
+  state.recordings = [...state.recordings, B];
+  // The matching channel of the new recording opens in its own panel, next to the first one.
+  const first = state.panels[0]?.[0]?.split(":")[1] ?? "accel/z";
+  state.panels.push([`pair-b:${first}`].filter(k => byKey(k)));
+  state.panels = state.panels.filter(p => p.length); layout();
+};
+const toggleOrientation = () => { state.orientation = state.orientation === "vertical" ? "horizontal" : "vertical"; layout(); };
+document.getElementById("orient").onclick = toggleOrientation;
+addEventListener("keydown", e => { if (e.key === "o" || e.key === "O") toggleOrientation(); });
+document.getElementById("theme").onclick = e => {
+  state.theme = { system: "light", light: "dark", dark: "system" }[state.theme];
+  state.theme === "system" ? document.documentElement.removeAttribute("data-theme") : document.documentElement.dataset.theme = state.theme;
+  e.target.textContent = `Theme: ${state.theme}`; layout();
+};
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", layout);
+addEventListener("resize", draw);
+presets("one");
+</script>
+</body>
+</html>

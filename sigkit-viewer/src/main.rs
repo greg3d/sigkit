@@ -2,6 +2,7 @@
 //! zoom, gestures first. See `docs/specs/` and `GLOSSARY.md`.
 
 mod app;
+mod layout;
 mod motion;
 mod plot;
 mod ticks;
@@ -18,24 +19,28 @@ use std::path::PathBuf;
     about = "Look at .sigrec recordings: min/max candles at every zoom"
 )]
 struct Cli {
-    /// A .sigrec recording to open (or drop one on the window)
-    recording: Option<PathBuf>,
+    /// .sigrec recordings to open, side by side (or drop them on the window)
+    recordings: Vec<PathBuf>,
     /// Time runs left to right instead of top to bottom
     #[arg(long)]
     horizontal: bool,
     /// Initial time window in seconds, as `from:to` (default: the whole recording)
     #[arg(long, value_parser = parse_window, value_name = "FROM:TO")]
     time: Option<(f64, f64)>,
-    /// The channel to draw first, as `stream/channel` (`stream/residual` for a
-    /// timestamped stream's residual)
+    /// The channel of the first recording to draw first, as `stream/channel`
+    /// (`stream/residual` for a timestamped stream's residual)
     #[arg(long, value_name = "STREAM/CHANNEL")]
     channel: Option<String>,
     /// Draw a residual against the fitted rate rather than the nominal one
     #[arg(long, hide = true)]
     subtract_fit: bool,
-    /// Save a PNG of the window once the recording is drawn, then quit
+    /// Save a PNG of the window once the recordings are drawn, then quit
     #[arg(long, hide = true, value_name = "PNG")]
     screenshot: Option<PathBuf>,
+    /// Show the cursor at this display time, in seconds, while the pointer is
+    /// off the plot
+    #[arg(long, hide = true, value_name = "SECONDS")]
+    cursor: Option<f64>,
 }
 
 fn parse_window(text: &str) -> Result<(f64, f64), String> {
@@ -53,7 +58,7 @@ fn parse_window(text: &str) -> Result<(f64, f64), String> {
 fn main() -> eframe::Result {
     let cli = Cli::parse();
     let options = app::Options {
-        recording: cli.recording,
+        recordings: cli.recordings,
         orientation: if cli.horizontal {
             view::Orientation::Horizontal
         } else {
@@ -63,11 +68,12 @@ fn main() -> eframe::Result {
         channel: cli.channel,
         subtract_fit: cli.subtract_fit,
         screenshot: cli.screenshot,
+        cursor: cli.cursor,
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("sigkit")
-            .with_inner_size([1100.0, 760.0])
+            .with_inner_size([1280.0, 800.0])
             .with_drag_and_drop(true),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()

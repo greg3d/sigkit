@@ -1,19 +1,23 @@
-//! The plot widget: one trace drawn on the egui painter as min/max candles,
-//! raw samples below the base bin, a 1-2-5 grid on both axes, a legend. It
-//! lives in along-time / across-value coordinates; [`Mapping`] does the
-//! orientation. Gestures move the view directly; jumps (keys, autoscale,
-//! box, wheel steps) ease to their target and a flick coasts, see
-//! [`crate::motion`].
+//! The plot widget: panels side by side along the stacking axis, sharing one
+//! time span, each with its own value axis. Every channel is drawn on the
+//! egui painter as min/max candles, raw samples below the base bin, over a
+//! 1-2-5 grid, with a legend chip per channel. A cursor line runs through
+//! every panel and reads each channel's nearest sample. The widget lives in
+//! along-time / across-value coordinates; [`Mapping`] does the orientation.
+//! Gestures move the view directly; jumps (keys, autoscale, box, wheel
+//! steps) ease to their target and a flick coasts, see [`crate::motion`].
 
+use crate::layout::{ChannelRef, Dragged, Drop, Layout, PanelId, Views};
 use crate::motion::{Inertia, Tween, VelocityTracker};
 use crate::ticks;
-use crate::trace::Trace;
+use crate::trace::{Reading, Trace};
 use crate::view::{Mapping, Orientation, Span, View};
 use egui::{
-    Color32, Event, FontId, Key, Mesh, MouseWheelSource, MouseWheelUnit, Pos2, Rect, Sense, Shape,
-    Stroke, StrokeKind, TouchPhase, Ui, Vec2, pos2, vec2,
+    Color32, Event, FontId, Galley, Key, Mesh, MouseWheelSource, MouseWheelUnit, Pos2, Rect, Sense,
+    Shape, Stroke, StrokeKind, TouchPhase, Ui, Vec2, pos2, vec2,
 };
 use sigkit_format::Bin;
+use std::sync::Arc;
 
 /// Least pixels between two grid lines along time.
 const MIN_PX_PER_TIME_TICK: f32 = 90.0;
@@ -96,24 +100,32 @@ const PALETTE: [(Color32, Color32); 8] = [
     ),
 ];
 
-/// The colour of the `index`th channel of a recording, in this theme.
+/// The colour of the `index`th channel in the tree, in this theme.
 pub fn channel_color(index: usize, dark_mode: bool) -> Color32 {
     let (light, dark) = PALETTE[index % PALETTE.len()];
     if dark_mode { dark } else { light }
 }
 
-/// What persists between frames: the view, the orientation, the mode, any
-/// motion in progress, and the buffers reused frame to frame. The shapes
+/// What persists between frames: the shared time span, the orientation, the
+/// mode, any motion in progress, and the buffers reused frame to frame. Each
+/// panel's value span lives in its [`crate::layout::Panel`]. The shapes
 /// handed to egui are owned by egui and rebuilt each frame.
 pub struct PlotState {
-    pub view: View,
+    /// What every panel shows along time.
+    pub time: Span,
     pub orientation: Orientation,
     pub mode: Mode,
-    tween: Option<Tween>,
-    inertia: Option<Inertia>,
+    tween: Option<Tween<Views>>,
+    /// A flick coasting, in the panel it was flicked in.
+    inertia: Option<(PanelId, Inertia)>,
     velocity: VelocityTracker,
-    /// Where the box being drawn started, on screen.
-    box_from: Option<Pos2>,
+    /// Where the box being drawn started, and in which panel.
+    box_from: Option<(PanelId, Pos2)>,
+    /// The panel the keys act on: the one last under the pointer.
+    focus: Option<PanelId>,
+    /// A cursor at this display time while the pointer is off the plot, for
+    /// scripted screenshots.
+    pub pinned_cursor: Option<f64>,
     wheel: Vec<Wheel>,
     candles: Vec<Bin>,
     samples: Vec<(f64, f64)>,
@@ -129,15 +141,17 @@ struct Wheel {
 }
 
 impl PlotState {
-    pub fn new(view: View, orientation: Orientation) -> PlotState {
+    pub fn new(time: Span, orientation: Orientation) -> PlotState {
         PlotState {
-            view,
+            time,
             orientation,
             mode: Mode::Pan,
             tween: None,
             inertia: None,
             velocity: VelocityTracker::default(),
             box_from: None,
+            focus: None,
+            pinned_cursor: None,
             wheel: Vec::new(),
             candles: Vec::new(),
             samples: Vec::new(),
@@ -145,46 +159,68 @@ impl PlotState {
         }
     }
 
-    /// Ease from the current view to `target`.
-    pub fn animate_to(&mut self, target: View, now: f64) {
+    /// What every panel shows now.
+    pub fn views(&self, layout: &Layout) -> Views {
+        Views::of(self.time, layout)
+    }
+
+    /// Ease from what the panels show to `target`.
+    pub fn animate_to(&mut self, layout: &Layout, target: Views, now: f64) {
         self.inertia = None;
-        self.tween = Some(Tween::new(self.view, target, now));
+        self.tween = Some(Tween::new(self.views(layout), target, now));
     }
 
-    /// Where the view is heading: the end of a running animation, or the
-    /// view itself. Steps (keys, wheel notches) add up from here, so a
+    /// Where the views are heading: the end of a running animation, or the
+    /// views themselves. Steps (keys, wheel notches) add up from here, so a
     /// second press during the animation goes twice as far.
-    pub fn target(&self) -> View {
-        self.tween.map(|t| t.target()).unwrap_or(self.view)
+    pub fn target(&self, layout: &Layout) -> Views {
+        match &self.tween {
+            Some(tween) => tween.target().clone(),
+            None => self.views(layout),
+        }
     }
 
-    /// True while the view animates or coasts.
+    /// True while the views animate or coast.
     pub fn is_moving(&self) -> bool {
         self.tween.is_some() || self.inertia.is_some()
     }
 
+    /// Whatever moved stops where it is: a direct gesture takes over, or the
+    /// panels changed under the motion.
+    pub fn interrupt(&mut self) {
+        self.tween = None;
+        self.inertia = None;
+    }
+
+    fn set(&mut self, layout: &mut Layout, views: &Views) {
+        self.time = views.time;
+        views.apply_to(layout);
+    }
+
     /// Advance any animation and coasting to `now`.
-    fn advance(&mut self, mapping: impl Fn(View) -> Mapping, now: f64) {
-        if let Some(tween) = self.tween {
-            self.view = tween.at(now);
-            if tween.is_done(now) {
+    fn advance(&mut self, layout: &mut Layout, panels: &Panels, now: f64) {
+        if let Some(tween) = &self.tween {
+            let views = tween.at(now);
+            let done = tween.is_done(now);
+            let applied = views.apply_to(layout);
+            if applied {
+                self.time = views.time;
+            }
+            if done || !applied {
                 self.tween = None;
             }
         }
-        if let Some(inertia) = &mut self.inertia {
+        if let Some((id, mut inertia)) = self.inertia {
             let delta = inertia.step(now);
-            self.view = mapping(self.view).panned(delta);
-            if inertia.is_done(now) {
-                self.inertia = None;
+            let views = self.views(layout);
+            match panels.mapping(&views, id) {
+                Some(mapping) => self.set(layout, &views.with_panel(id, mapping.panned(delta))),
+                None => self.inertia = None,
+            }
+            if self.inertia.is_some() {
+                self.inertia = (!inertia.is_done(now)).then_some((id, inertia));
             }
         }
-    }
-
-    /// A direct gesture takes over: the view stays where the animation had
-    /// got to, and nothing coasts.
-    fn interrupt(&mut self) {
-        self.tween = None;
-        self.inertia = None;
     }
 
     /// Fingers down: whatever moved stops, and a new velocity is measured.
@@ -193,77 +229,392 @@ impl PlotState {
         self.velocity.clear();
     }
 
-    /// Move the content by `delta` points as a pan gesture reports it.
-    fn pan(&mut self, mapping: &Mapping, delta: Vec2, now: f64) {
-        self.view = mapping.panned(delta);
-        self.velocity.add(now, delta);
+    /// Move panel `id`'s content by `delta` points as a pan gesture reports it.
+    fn pan(&mut self, layout: &mut Layout, panels: &Panels, id: PanelId, delta: Vec2, now: f64) {
+        let views = self.views(layout);
+        if let Some(mapping) = panels.mapping(&views, id) {
+            self.set(layout, &views.with_panel(id, mapping.panned(delta)));
+            self.velocity.add(now, delta);
+        }
     }
 
     /// Fingers lifted: coast if they were still moving.
-    fn release_pan(&mut self, now: f64) {
-        self.inertia = Inertia::flick(self.velocity.velocity(now), now);
+    fn release_pan(&mut self, id: PanelId, now: f64) {
+        self.inertia = Inertia::flick(self.velocity.velocity(now), now).map(|i| (id, i));
         self.velocity.clear();
     }
 
-    /// The box being drawn, from where the drag started to `to`, inside `rect`.
-    fn drawn_box(&self, to: Option<Pos2>, rect: Rect) -> Option<Rect> {
-        Some(Rect::from_two_pos(self.box_from?, to?).intersect(rect))
+    /// Ease panel `id` of the target views to `view`.
+    fn animate_panel(&mut self, layout: &Layout, id: PanelId, view: View, now: f64) {
+        let target = self.target(layout).with_panel(id, view);
+        self.animate_to(layout, target, now);
     }
 }
 
-/// The channel the plot draws and how it is labelled.
+/// One channel a panel draws and how it is labelled.
 pub struct Series<'a> {
     pub trace: &'a Trace,
     pub label: &'a str,
     pub unit: &'a str,
+    /// The unit of a time column's raw stamps, for the cursor readout.
+    pub stamp_unit: &'a str,
     pub color: Color32,
+    pub channel: ChannelRef,
 }
 
 /// What the plot reports back to the app this frame.
 pub struct Shown {
     /// The display time under the pointer.
     pub hover_time: Option<f64>,
+    /// The whole plot area.
+    pub area: Rect,
+    /// Each panel's rectangle, in layout order.
+    pub panels: Vec<Rect>,
 }
 
-/// Draw `series` into the available space and handle its gestures and keys:
+impl Shown {
+    /// Where a channel dragged to `pos` would land; `None` off the plot.
+    pub fn drop_target(&self, orientation: Orientation, pos: Pos2) -> Option<Drop> {
+        if !self.area.contains(pos) {
+            return None;
+        }
+        let along = |r: Rect| match orientation {
+            Orientation::Vertical => (r.min.x, r.max.x),
+            Orientation::Horizontal => (r.min.y, r.max.y),
+        };
+        let spans: Vec<(f32, f32)> = self.panels.iter().map(|&r| along(r)).collect();
+        let at = match orientation {
+            Orientation::Vertical => pos.x,
+            Orientation::Horizontal => pos.y,
+        };
+        crate::layout::drop_target(&spans, at)
+    }
+}
+
+/// The panels' rectangles this frame, and their ids, in layout order.
+struct Panels {
+    ids: Vec<PanelId>,
+    rects: Vec<Rect>,
+    orientation: Orientation,
+}
+
+impl Panels {
+    /// The area split evenly along the stacking axis: left to right when
+    /// time runs vertically, top to bottom when it runs horizontally.
+    fn new(area: Rect, layout: &Layout, orientation: Orientation) -> Panels {
+        let ids: Vec<PanelId> = layout.panels().iter().map(|p| p.id).collect();
+        let n = ids.len().max(1) as f32;
+        let rects = (0..ids.len())
+            .map(|i| {
+                let (a, b) = (i as f32 / n, (i + 1) as f32 / n);
+                match orientation {
+                    Orientation::Vertical => Rect::from_x_y_ranges(
+                        area.min.x + a * area.width()..=area.min.x + b * area.width(),
+                        area.y_range(),
+                    ),
+                    Orientation::Horizontal => Rect::from_x_y_ranges(
+                        area.x_range(),
+                        area.min.y + a * area.height()..=area.min.y + b * area.height(),
+                    ),
+                }
+            })
+            .collect();
+        Panels {
+            ids,
+            rects,
+            orientation,
+        }
+    }
+
+    /// Panel `id`'s part of `views`, laid onto its rectangle.
+    fn mapping(&self, views: &Views, id: PanelId) -> Option<Mapping> {
+        let i = self.ids.iter().position(|&p| p == id)?;
+        Some(Mapping::new(
+            self.rects[i],
+            self.orientation,
+            views.panel(id)?,
+        ))
+    }
+}
+
+/// The value span that fits every one of `traces` over `time`, or over its
+/// whole signal when `time` is `None`; `None` when there is nothing to fit.
+pub fn fitted_value<'a>(
+    traces: impl IntoIterator<Item = &'a Trace>,
+    time: Option<Span>,
+) -> Option<Span> {
+    let mut all = Bin::EMPTY;
+    for trace in traces {
+        let range = match time {
+            Some(time) => trace.range(time),
+            None => trace.whole_signal(),
+        };
+        if let Some((lo, hi)) = range {
+            all.include(lo);
+            all.include(hi);
+        }
+    }
+    (!all.is_empty()).then(|| Span::fitted(all.min as f64, all.max as f64))
+}
+
+/// Draw the panels of `layout`, panel `i` holding `series[i]`, into the
+/// available space and handle their gestures and keys:
 ///
-/// - pinch zooms time about the cursor, `Shift+pinch` value; `+`/`-` zoom
-///   time by two about the cursor (with `Shift`, value), animated;
+/// - pinch zooms time about the cursor, `Shift+pinch` the value of the panel
+///   under it; `+`/`-` zoom time by two about the cursor (with `Shift`,
+///   value), animated;
 /// - two-finger scroll pans and, released moving, coasts; dragging in Pan
 ///   mode does the same; the arrow keys pan by a quarter view (not in
 ///   Align); a tap stops a coast;
-/// - double-click and `A` fit the value axis to the visible window,
-///   double-click on the legend and `Shift+A` to the whole signal, a box
-///   drawn in Box mode becomes the view. All animate.
-pub fn show(ui: &mut Ui, series: &Series, state: &mut PlotState) -> Shown {
-    let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-    if rect.width() < 2.0 || rect.height() < 2.0 {
-        return Shown { hover_time: None };
-    }
-    let trace = series.trace;
+/// - double-click fits a panel's value axis to the visible window, `A` the
+///   panel under the pointer (every panel when it is over none), `Shift+A`
+///   the same to the whole signal; double-click on a legend fits its
+///   channel's whole signal; a box drawn in Box mode becomes the view. All
+///   animate.
+///
+/// Every panel shows the same time; a gesture in one moves time in all of
+/// them and value only in itself. A legend chip dragged away carries its
+/// channel as a [`Dragged`] payload.
+pub fn show(
+    ui: &mut Ui,
+    layout: &mut Layout,
+    series: &[Vec<Series>],
+    state: &mut PlotState,
+) -> Shown {
+    let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
     let orientation = state.orientation;
-    let mapping_of = |view: View| Mapping::new(rect, orientation, view);
+    let panels = Panels::new(area, layout, orientation);
+    let colors = Colors::of(ui.visuals());
+    let mut shown = Shown {
+        hover_time: None,
+        area,
+        panels: panels.rects.clone(),
+    };
+    if area.width() < 2.0 || area.height() < 2.0 {
+        return shown;
+    }
+    if panels.ids.is_empty() {
+        let painter = ui.painter_at(area);
+        painter.rect_filled(area, 0.0, colors.background);
+        painter.text(
+            area.center(),
+            egui::Align2::CENTER_CENTER,
+            "drag a channel here from the tree",
+            FontId::proportional(13.0),
+            colors.text,
+        );
+        return shown;
+    }
     let now = ui.input(|i| i.time);
-    state.advance(mapping_of, now);
+    state.advance(layout, &panels, now);
 
-    let colors = Colors::of(ui.visuals(), series.color);
-    let legend = Legend::new(ui, &mapping_of(state.view), series, &colors);
-    let legend_response = ui.interact(legend.rect, response.id.with("legend"), Sense::click());
+    let pointer = ui
+        .input(|i| i.pointer.hover_pos())
+        .filter(|&p| ui.rect_contains_pointer(area) && area.contains(p));
+    let hovered = pointer.and_then(|p| panels.rects.iter().position(|r| r.contains(p)));
+    if let Some(i) = hovered {
+        state.focus = Some(panels.ids[i]);
+    }
+    let responses: Vec<egui::Response> = panels
+        .ids
+        .iter()
+        .zip(&panels.rects)
+        .map(|(id, rect)| {
+            ui.interact(
+                *rect,
+                ui.scope_id().with(("panel", *id)),
+                Sense::click_and_drag(),
+            )
+        })
+        .collect();
 
-    let hovered = response.hovered() || legend_response.hovered();
-    let cursor = response.hover_pos();
-
-    // A tap stops a coast.
-    if hovered && ui.input(|i| i.pointer.any_pressed()) {
-        state.inertia = None;
+    // While a channel is dragged the plot holds still under the drop target.
+    let dragging = egui::DragAndDrop::has_any_payload(ui.ctx());
+    if let Some(i) = hovered.filter(|_| !dragging) {
+        // A tap stops a coast.
+        if ui.input(|i| i.pointer.any_pressed()) {
+            state.inertia = None;
+        }
+        scroll_and_pinch(ui, state, layout, &panels, i, pointer, now);
     }
 
-    // Two-finger scroll and wheels. The OS's own momentum is ignored: the
-    // plot coasts by itself, so a tap can stop it.
-    if hovered {
-        state.wheel.clear();
-        ui.input(|i| {
-            state.wheel.extend(i.events.iter().filter_map(|e| match e {
+    // Dragging: pan with inertia, or draw a box.
+    for (i, response) in responses.iter().enumerate() {
+        let id = panels.ids[i];
+        match state.mode {
+            Mode::Pan => {
+                if response.drag_started() {
+                    state.begin_pan();
+                }
+                if response.dragged() {
+                    state.pan(layout, &panels, id, response.drag_delta(), now);
+                }
+                if response.drag_stopped() {
+                    state.release_pan(id, now);
+                }
+            }
+            Mode::Box => {
+                if response.drag_started()
+                    && let Some(from) = ui.input(|i| i.pointer.press_origin())
+                {
+                    state.box_from = Some((id, from));
+                }
+                if response.drag_stopped()
+                    && let (Some((_, from)), Some(to)) =
+                        (state.box_from.take(), response.interact_pointer_pos())
+                {
+                    let drawn = Rect::from_two_pos(from, to).intersect(panels.rects[i]);
+                    let views = state.views(layout);
+                    if drawn.width() >= MIN_BOX_PX
+                        && drawn.height() >= MIN_BOX_PX
+                        && let Some(mapping) = panels.mapping(&views, id)
+                    {
+                        state.animate_panel(layout, id, mapping.view_of(drawn), now);
+                    }
+                }
+            }
+            Mode::Align => {}
+        }
+        // Double-click fits this panel to the visible window.
+        if response.double_clicked() {
+            autoscale(state, layout, series, &[i], false, now);
+        }
+    }
+
+    // A or Shift+A: the panel under the pointer, or every panel.
+    let (key_a, shift) = ui.input(|i| (i.key_pressed(Key::A), i.modifiers.shift));
+    if key_a {
+        let which: Vec<usize> = match hovered {
+            Some(i) => vec![i],
+            None => (0..panels.ids.len()).collect(),
+        };
+        autoscale(state, layout, series, &which, shift, now);
+    }
+
+    let focus = state
+        .focus
+        .and_then(|id| panels.ids.iter().position(|&p| p == id))
+        .unwrap_or(0);
+    keys(ui, state, layout, &panels, focus, pointer, now);
+
+    if state.is_moving() {
+        ui.ctx().request_repaint();
+    }
+
+    let views = state.views(layout);
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    shown.hover_time = hovered
+        .zip(pointer)
+        .and_then(|(i, p)| Some(panels.mapping(&views, panels.ids[i])?.data_at(p).0))
+        .or(state.pinned_cursor);
+    // Time labels where time starts on the stacking axis: the first panel
+    // when vertical, the last when horizontal.
+    let time_panel = match orientation {
+        Orientation::Vertical => 0,
+        Orientation::Horizontal => panels.ids.len() - 1,
+    };
+    for (i, &id) in panels.ids.iter().enumerate() {
+        let Some(mapping) = panels.mapping(&views, id) else {
+            continue;
+        };
+        let rect = panels.rects[i];
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, colors.background);
+        let grid = Grid::new(&mapping, common_unit(&series[i]), i == time_panel);
+        grid.draw_lines(&painter, &colors);
+        for s in &series[i] {
+            draw_trace(&painter, &mapping, s, state, pixels_per_point);
+        }
+        grid.draw_labels(&painter, &colors);
+
+        let readings: Vec<Option<Reading>> = series[i]
+            .iter()
+            .map(|s| shown.hover_time.and_then(|t| s.trace.nearest(t)))
+            .collect();
+        if let Some(t) = shown.hover_time {
+            draw_cursor(
+                &painter,
+                &mapping,
+                t,
+                &series[i],
+                &readings,
+                i == time_panel,
+                &colors,
+            );
+        }
+
+        let legend = Legend::new(ui, &mapping, &series[i], &readings, &colors);
+        for (k, chip) in legend.chips.iter().enumerate() {
+            let response = ui.interact(
+                chip.rect,
+                ui.scope_id().with(("legend", id, k)),
+                Sense::click_and_drag(),
+            );
+            response.dnd_set_drag_payload(Dragged {
+                channel: series[i][k].channel,
+                from: Some(id),
+            });
+            if response.double_clicked()
+                && let Some(value) = fitted_value([series[i][k].trace], None)
+            {
+                let time = state.target(layout).time;
+                state.animate_panel(layout, id, View { time, value }, now);
+            }
+            chip.draw(&painter, &colors, series[i][k].color, response.hovered());
+        }
+
+        if state.mode == Mode::Box
+            && let Some((box_id, from)) = state.box_from
+            && box_id == id
+            && let Some(to) = responses[i].interact_pointer_pos()
+        {
+            let drawn = Rect::from_two_pos(from, to).intersect(rect);
+            let line = series[i].first().map_or(colors.text, |s| s.color);
+            painter.rect(
+                drawn,
+                2.0,
+                line.gamma_multiply(0.12),
+                Stroke::new(1.0, line),
+                StrokeKind::Inside,
+            );
+        }
+    }
+    // A hairline between neighbouring panels.
+    let painter = ui.painter_at(area);
+    for rect in &panels.rects[1..] {
+        match orientation {
+            Orientation::Vertical => painter.vline(
+                painter.round_to_pixel_center(rect.min.x),
+                area.y_range(),
+                Stroke::new(1.0, colors.separator),
+            ),
+            Orientation::Horizontal => painter.hline(
+                area.x_range(),
+                painter.round_to_pixel_center(rect.min.y),
+                Stroke::new(1.0, colors.separator),
+            ),
+        };
+    }
+    shown
+}
+
+/// Two-finger scroll, wheels and pinch over panel `i`. The OS's own momentum
+/// is ignored: the plot coasts by itself, so a tap can stop it.
+fn scroll_and_pinch(
+    ui: &Ui,
+    state: &mut PlotState,
+    layout: &mut Layout,
+    panels: &Panels,
+    i: usize,
+    cursor: Option<Pos2>,
+    now: f64,
+) {
+    let id = panels.ids[i];
+    state.wheel.clear();
+    ui.input(|input| {
+        state
+            .wheel
+            .extend(input.events.iter().filter_map(|e| match e {
                 Event::MouseWheel {
                     unit,
                     delta,
@@ -278,160 +629,88 @@ pub fn show(ui: &mut Ui, series: &Series, state: &mut PlotState) -> Shown {
                 }),
                 _ => None,
             }))
-        });
-        let line_px = ui.ctx().options(|o| o.input_options.line_scroll_speed);
-        for k in 0..state.wheel.len() {
-            let wheel = &state.wheel[k];
-            let (delta, unit) = (wheel.delta, wheel.unit);
-            match (wheel.source, unit, wheel.phase) {
-                (MouseWheelSource::Momentum, ..) => {}
-                (_, _, TouchPhase::Start) => state.begin_pan(),
-                (MouseWheelSource::Trackpad, _, TouchPhase::End | TouchPhase::Cancel) => {
-                    state.release_pan(now)
-                }
-                (_, MouseWheelUnit::Point, _) => {
-                    state.interrupt();
-                    state.pan(&mapping_of(state.view), delta, now);
-                }
-                (..) => {
-                    // A wheel notch is a step: ease to it.
-                    let step = match unit {
-                        MouseWheelUnit::Page => delta * rect.size(),
-                        _ => delta * line_px,
-                    };
-                    let target = mapping_of(state.target()).panned(step);
-                    state.animate_to(target, now);
+    });
+    let line_px = ui.ctx().options(|o| o.input_options.line_scroll_speed);
+    for k in 0..state.wheel.len() {
+        let wheel = &state.wheel[k];
+        let (delta, unit) = (wheel.delta, wheel.unit);
+        match (wheel.source, unit, wheel.phase) {
+            (MouseWheelSource::Momentum, ..) => {}
+            (_, _, TouchPhase::Start) => state.begin_pan(),
+            (MouseWheelSource::Trackpad, _, TouchPhase::End | TouchPhase::Cancel) => {
+                state.release_pan(id, now)
+            }
+            (_, MouseWheelUnit::Point, _) => {
+                state.interrupt();
+                state.pan(layout, panels, id, delta, now);
+            }
+            (..) => {
+                // A wheel notch is a step: ease to it.
+                let step = match unit {
+                    MouseWheelUnit::Page => delta * panels.rects[i].size(),
+                    _ => delta * line_px,
+                };
+                let target = state.target(layout);
+                if let Some(mapping) = panels.mapping(&target, id) {
+                    state.animate_to(layout, target.with_panel(id, mapping.panned(step)), now);
                 }
             }
         }
+    }
 
-        let (zoom, shift) = ui.input(|i| (i.zoom_delta(), i.modifiers.shift));
-        if let Some(cursor) = cursor
-            && zoom != 1.0
-        {
-            state.interrupt();
-            let mapping = mapping_of(state.view);
-            state.view = if shift {
+    let (zoom, shift) = ui.input(|i| (i.zoom_delta(), i.modifiers.shift));
+    if let Some(cursor) = cursor
+        && zoom != 1.0
+    {
+        state.interrupt();
+        let views = state.views(layout);
+        if let Some(mapping) = panels.mapping(&views, id) {
+            let view = if shift {
                 mapping.zoomed_value(zoom as f64, cursor)
             } else {
                 mapping.zoomed_time(zoom as f64, cursor)
             };
+            state.set(layout, &views.with_panel(id, view));
         }
-    }
-
-    // Dragging: pan with inertia, or draw a box.
-    match state.mode {
-        Mode::Pan => {
-            if response.drag_started() {
-                state.begin_pan();
-            }
-            if response.dragged() {
-                state.pan(&mapping_of(state.view), response.drag_delta(), now);
-            }
-            if response.drag_stopped() {
-                state.release_pan(now);
-            }
-        }
-        Mode::Box => {
-            if response.drag_started() {
-                state.box_from = ui.input(|i| i.pointer.press_origin());
-            }
-            if response.drag_stopped()
-                && let (Some(from), Some(to)) =
-                    (state.box_from.take(), response.interact_pointer_pos())
-            {
-                let drawn = Rect::from_two_pos(from, to).intersect(rect);
-                if drawn.width() >= MIN_BOX_PX && drawn.height() >= MIN_BOX_PX {
-                    let target = mapping_of(state.view).view_of(drawn);
-                    state.animate_to(target, now);
-                }
-            }
-        }
-        Mode::Align => {}
-    }
-
-    // Autoscale: double-click or A to the window, legend or Shift+A to all.
-    let (key_a, shift) = ui.input(|i| (i.key_pressed(Key::A), i.modifiers.shift));
-    let whole = legend_response.double_clicked() || (key_a && shift);
-    let visible = response.double_clicked() || (key_a && !shift);
-    if whole || visible {
-        let target = state.target();
-        let range = if whole {
-            trace.whole_signal()
-        } else {
-            trace.range(target.time)
-        };
-        if let Some((lo, hi)) = range {
-            let value = Span::fitted(lo, hi);
-            state.animate_to(View { value, ..target }, now);
-        }
-    }
-
-    keys(ui, state, rect, cursor, now);
-
-    if state.is_moving() {
-        ui.ctx().request_repaint();
-    }
-    let mapping = mapping_of(state.view);
-
-    // Candles are computed per physical pixel, not per point, so a Retina
-    // screen gets one candle per device pixel.
-    let pixels_per_point = ui.ctx().pixels_per_point();
-    let px = (mapping.along_px() * pixels_per_point).round().max(1.0) as usize;
-    let time_per_px = state.view.time.len() / px as f64;
-    let sparse = trace.draws_samples(time_per_px);
-    if sparse {
-        trace.samples(state.view.time, &mut state.samples);
-    } else {
-        trace.candles(state.view.time, px, &mut state.candles);
-    }
-
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, colors.background);
-    let grid = Grid::new(&mapping, series.unit);
-    grid.draw_lines(&painter, &colors);
-    if sparse {
-        let dots =
-            trace.samples_per_px(time_per_px * pixels_per_point as f64) <= 1.0 / DOT_SPACING_PX;
-        draw_samples(
-            &painter,
-            &mapping,
-            &state.samples,
-            &mut state.points,
-            Stroke::new(1.0, colors.line),
-            dots,
-        );
-    } else {
-        draw_candles(
-            &painter,
-            &mapping,
-            &state.candles,
-            pixels_per_point,
-            colors.line,
-        );
-    }
-    grid.draw_labels(&painter, &colors);
-    legend.draw(&painter, &colors, legend_response.hovered());
-    if state.mode == Mode::Box
-        && let Some(drawn) = state.drawn_box(response.interact_pointer_pos(), rect)
-    {
-        painter.rect(
-            drawn,
-            2.0,
-            colors.box_fill,
-            Stroke::new(1.0, colors.line),
-            StrokeKind::Inside,
-        );
-    }
-    Shown {
-        hover_time: cursor.map(|p| mapping.data_at(p).0),
     }
 }
 
-/// The plot's keys: `+`/`-` zoom time by two about the cursor (or the
-/// centre), with `Shift` value; the arrows pan by a quarter view, except in
-/// Align, which keeps them for nudging. Each is a step, so it eases.
-fn keys(ui: &Ui, state: &mut PlotState, rect: Rect, cursor: Option<Pos2>, now: f64) {
+/// Fit the value axis of each panel in `which` to its channels over the
+/// visible window, or over their whole signals, in one animation.
+pub fn autoscale(
+    state: &mut PlotState,
+    layout: &Layout,
+    series: &[Vec<Series>],
+    which: &[usize],
+    whole: bool,
+    now: f64,
+) {
+    let mut target = state.target(layout);
+    for &i in which {
+        let id = layout.panels()[i].id;
+        let time = target.time;
+        if let Some(value) =
+            fitted_value(series[i].iter().map(|s| s.trace), (!whole).then_some(time))
+        {
+            target = target.with_panel(id, View { time, value });
+        }
+    }
+    state.animate_to(layout, target, now);
+}
+
+/// The plot's keys, on the focused panel: `+`/`-` zoom time by two about the
+/// cursor (or the centre), with `Shift` value; the arrows pan by a quarter
+/// view, except in Align, which keeps them for nudging. Each is a step, so
+/// it eases.
+fn keys(
+    ui: &Ui,
+    state: &mut PlotState,
+    layout: &Layout,
+    panels: &Panels,
+    focus: usize,
+    cursor: Option<Pos2>,
+    now: f64,
+) {
     let (zoom, value, arrow) = ui.input(|i| {
         let mut zoom = 1.0;
         let mut arrow = Vec2::ZERO;
@@ -457,106 +736,344 @@ fn keys(ui: &Ui, state: &mut PlotState, rect: Rect, cursor: Option<Pos2>, now: f
         }
         (zoom, i.modifiers.shift, arrow)
     });
+    let id = panels.ids[focus];
+    let rect = panels.rects[focus];
+    let target = state.target(layout);
+    let Some(mapping) = panels.mapping(&target, id) else {
+        return;
+    };
     if zoom != 1.0 {
-        let mapping = Mapping::new(rect, state.orientation, state.target());
-        let about = cursor.unwrap_or(rect.center());
-        let target = if value {
+        let about = cursor
+            .filter(|p| rect.contains(*p))
+            .unwrap_or(rect.center());
+        let view = if value {
             mapping.zoomed_value(zoom, about)
         } else {
             mapping.zoomed_time(zoom, about)
         };
-        state.animate_to(target, now);
-    }
-    if arrow != Vec2::ZERO && state.mode != Mode::Align {
+        state.animate_to(layout, target.with_panel(id, view), now);
+    } else if arrow != Vec2::ZERO && state.mode != Mode::Align {
         // The window moves the way the arrow points; the content the other.
-        let mapping = Mapping::new(rect, state.orientation, state.target());
-        let target = mapping.panned(-arrow * rect.size() * ARROW_PAN);
-        state.animate_to(target, now);
+        let view = mapping.panned(-arrow * rect.size() * ARROW_PAN);
+        state.animate_to(layout, target.with_panel(id, view), now);
     }
 }
 
-/// The legend: a chip in the corner no axis labels use (bottom right when
-/// vertical, top right when horizontal) with the channel's colour and name.
-/// Double-click fits the whole signal.
+/// The unit every channel on a panel shares, or none when they differ.
+fn common_unit<'a>(series: &[Series<'a>]) -> &'a str {
+    match series.split_first() {
+        Some((first, rest)) if rest.iter().all(|s| s.unit == first.unit) => first.unit,
+        _ => "",
+    }
+}
+
+/// One channel as candles or, zoomed in far enough, as its raw samples.
+/// Candles are computed per physical pixel, not per point, so a Retina screen
+/// gets one candle per device pixel.
+fn draw_trace(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    series: &Series,
+    state: &mut PlotState,
+    pixels_per_point: f32,
+) {
+    let trace = series.trace;
+    let time = mapping.view.time;
+    let px = (mapping.along_px() * pixels_per_point).round().max(1.0) as usize;
+    let time_per_px = time.len() / px as f64;
+    if trace.draws_samples(time_per_px) {
+        trace.samples(time, &mut state.samples);
+        let dots =
+            trace.samples_per_px(time_per_px * pixels_per_point as f64) <= 1.0 / DOT_SPACING_PX;
+        draw_samples(
+            painter,
+            mapping,
+            &state.samples,
+            &mut state.points,
+            Stroke::new(1.0, series.color),
+            dots,
+        );
+    } else {
+        trace.candles(time, px, &mut state.candles);
+        draw_candles(
+            painter,
+            mapping,
+            &state.candles,
+            pixels_per_point,
+            series.color,
+        );
+    }
+}
+
+/// The cursor across the panel at display time `t`, a dot on each channel's
+/// nearest sample, and on the time panel the instant itself.
+fn draw_cursor(
+    painter: &egui::Painter,
+    mapping: &Mapping,
+    t: f64,
+    series: &[Series],
+    readings: &[Option<Reading>],
+    time_label: bool,
+    colors: &Colors,
+) {
+    let rect = mapping.rect;
+    let along = painter.round_to_pixel_center(mapping.time_to_along(t));
+    let (a, b) = match mapping.orientation {
+        Orientation::Vertical => (pos2(rect.min.x, along), pos2(rect.max.x, along)),
+        Orientation::Horizontal => (pos2(along, rect.min.y), pos2(along, rect.max.y)),
+    };
+    painter.extend(Shape::dashed_line(
+        &[a, b],
+        Stroke::new(1.0, colors.cursor),
+        3.0,
+        3.0,
+    ));
+    for (s, reading) in series.iter().zip(readings) {
+        if let Some(r) = reading {
+            let p = mapping.screen_pos(r.time, r.value);
+            if rect.contains(p) {
+                painter.circle(p, 3.5, colors.background, Stroke::new(1.5, s.color));
+            }
+        }
+    }
+    if time_label {
+        // As many decimals as a pixel along time resolves.
+        let decimals = (-mapping.time_per_px().log10()).ceil().clamp(0.0, 9.0) as usize;
+        let text = format!("{t:.decimals$} s");
+        let (pos, anchor) = match mapping.orientation {
+            Orientation::Vertical => (pos2(rect.min.x + 4.0, along), egui::Align2::LEFT_CENTER),
+            Orientation::Horizontal => {
+                (pos2(along, rect.max.y - 18.0), egui::Align2::CENTER_BOTTOM)
+            }
+        };
+        label_with_pill(
+            painter,
+            pos,
+            anchor,
+            &text,
+            &FontId::proportional(11.0),
+            colors,
+            colors.background,
+        );
+    }
+}
+
+/// The legend: a chip per channel, stacked in the corner no axis labels use
+/// (bottom right when vertical, top right when horizontal), with the
+/// channel's colour and name and, under the cursor, its nearest sample's
+/// value and stamp. Double-click fits the channel's whole signal; dragging a
+/// chip moves its channel.
 struct Legend {
+    chips: Vec<Chip>,
+}
+
+struct Chip {
     rect: Rect,
-    galley: std::sync::Arc<egui::Galley>,
+    name: Arc<Galley>,
+    /// The reading's value and unit, then its stamp, when the cursor is on.
+    lines: Vec<Arc<Galley>>,
 }
 
 impl Legend {
     const SWATCH: f32 = 14.0;
     const PAD: Vec2 = vec2(8.0, 4.0);
+    const GAP: f32 = 4.0;
 
-    fn new(ui: &Ui, mapping: &Mapping, series: &Series, colors: &Colors) -> Legend {
-        let galley = ui.painter().layout_no_wrap(
-            series.label.to_string(),
-            FontId::proportional(12.0),
-            colors.text,
-        );
-        let size = vec2(Self::SWATCH + 6.0, 0.0) + galley.size() + 2.0 * Self::PAD;
+    fn new(
+        ui: &Ui,
+        mapping: &Mapping,
+        series: &[Series],
+        readings: &[Option<Reading>],
+        colors: &Colors,
+    ) -> Legend {
+        let painter = ui.painter();
+        let mono = FontId::monospace(11.0);
+        let mut chips: Vec<Chip> = series
+            .iter()
+            .zip(readings)
+            .map(|(s, reading)| {
+                let name = painter.layout_no_wrap(
+                    s.label.to_string(),
+                    FontId::proportional(12.0),
+                    colors.text,
+                );
+                let mut lines = Vec::new();
+                if let Some(r) = reading {
+                    let value = format!("{} {}", r.value_text(), s.unit);
+                    lines.push(painter.layout_no_wrap(
+                        value.trim_end().to_string(),
+                        mono.clone(),
+                        colors.strong,
+                    ));
+                    if let Some(stamp) = r.stamp {
+                        let stamp = format!("{stamp} {}", s.stamp_unit);
+                        lines.push(painter.layout_no_wrap(stamp, mono.clone(), colors.text));
+                    }
+                }
+                let indent = Self::SWATCH + 6.0;
+                let width = lines
+                    .iter()
+                    .map(|g| g.size().x)
+                    .fold(name.size().x, f32::max);
+                let height = name.size().y + lines.iter().map(|g| g.size().y).sum::<f32>();
+                Chip {
+                    rect: Rect::from_min_size(
+                        Pos2::ZERO,
+                        vec2(indent + width, height) + 2.0 * Self::PAD,
+                    ),
+                    name,
+                    lines,
+                }
+            })
+            .collect();
+        // Stack away from the corner, first channel nearest the time axis's
+        // start.
         let plot = mapping.rect.shrink(8.0);
-        let corner = match mapping.orientation {
-            Orientation::Vertical => egui::Align2::RIGHT_BOTTOM,
-            Orientation::Horizontal => egui::Align2::RIGHT_TOP,
-        };
-        let pos = match mapping.orientation {
-            Orientation::Vertical => plot.right_bottom(),
-            Orientation::Horizontal => plot.right_top(),
-        };
-        Legend {
-            rect: corner.anchor_size(pos, size),
-            galley,
+        match mapping.orientation {
+            Orientation::Vertical => {
+                let mut bottom = plot.max.y;
+                for chip in chips.iter_mut().rev() {
+                    chip.rect = egui::Align2::RIGHT_BOTTOM
+                        .anchor_size(pos2(plot.max.x, bottom), chip.rect.size());
+                    bottom = chip.rect.min.y - Self::GAP;
+                }
+            }
+            Orientation::Horizontal => {
+                let mut top = plot.min.y;
+                for chip in chips.iter_mut() {
+                    chip.rect = egui::Align2::RIGHT_TOP
+                        .anchor_size(pos2(plot.max.x, top), chip.rect.size());
+                    top = chip.rect.max.y + Self::GAP;
+                }
+            }
         }
+        Legend { chips }
     }
+}
 
-    fn draw(&self, painter: &egui::Painter, colors: &Colors, hovered: bool) {
+impl Chip {
+    fn draw(&self, painter: &egui::Painter, colors: &Colors, line: Color32, hovered: bool) {
         let fill = if hovered {
             colors.pill_hover
         } else {
             colors.pill
         };
         painter.rect_filled(self.rect, 6.0, fill);
-        let y = self.rect.center().y;
-        let x = self.rect.min.x + Self::PAD.x;
-        painter.hline(x..=x + Self::SWATCH, y, Stroke::new(2.0, colors.line));
-        let text_pos = pos2(x + Self::SWATCH + 6.0, y - self.galley.size().y / 2.0);
-        painter.galley(text_pos, self.galley.clone(), colors.text);
+        let x = self.rect.min.x + Legend::PAD.x;
+        let mut y = self.rect.min.y + Legend::PAD.y;
+        let name_mid = y + self.name.size().y / 2.0;
+        painter.hline(x..=x + Legend::SWATCH, name_mid, Stroke::new(2.0, line));
+        let text_x = x + Legend::SWATCH + 6.0;
+        painter.galley(pos2(text_x, y), self.name.clone(), colors.text);
+        y += self.name.size().y;
+        for galley in &self.lines {
+            painter.galley(pos2(text_x, y), galley.clone(), colors.text);
+            y += galley.size().y;
+        }
     }
+}
+
+/// Where a channel dragged over the plot would land: a dashed outline over
+/// the panel it would overlay, or a bar on the edge where a new panel would
+/// open. `text` says which.
+pub fn draw_drop(
+    painter: &egui::Painter,
+    shown: &Shown,
+    orientation: Orientation,
+    drop: Drop,
+    color: Color32,
+    text: &str,
+) {
+    let target = match drop {
+        Drop::Overlay(i) => shown.panels[i].shrink(4.0),
+        Drop::NewPanel(_) if shown.panels.is_empty() => shown.area.shrink(4.0),
+        Drop::NewPanel(i) => {
+            let edge = match (orientation, shown.panels.get(i)) {
+                (Orientation::Vertical, Some(r)) => r.min.x,
+                (Orientation::Vertical, None) => shown.area.max.x,
+                (Orientation::Horizontal, Some(r)) => r.min.y,
+                (Orientation::Horizontal, None) => shown.area.max.y,
+            };
+            let area = shown.area.shrink(2.0);
+            match orientation {
+                Orientation::Vertical => {
+                    let x = edge.clamp(area.min.x + 2.0, area.max.x - 2.0);
+                    Rect::from_x_y_ranges(x - 2.0..=x + 2.0, area.y_range())
+                }
+                Orientation::Horizontal => {
+                    let y = edge.clamp(area.min.y + 2.0, area.max.y - 2.0);
+                    Rect::from_x_y_ranges(area.x_range(), y - 2.0..=y + 2.0)
+                }
+            }
+        }
+    };
+    let bar = target.width() <= 4.0 || target.height() <= 4.0;
+    if bar {
+        painter.rect_filled(target, 2.0, color);
+    } else {
+        draw_outline(painter, target, color);
+    }
+    let galley =
+        painter.layout_no_wrap(text.to_string(), FontId::proportional(12.0), Color32::WHITE);
+    let tag = Rect::from_center_size(target.center(), galley.size() + vec2(16.0, 6.0));
+    painter.rect_filled(tag, 9.0, color);
+    painter.galley(tag.center() - galley.size() / 2.0, galley, Color32::WHITE);
+}
+
+/// A drop target's area: tinted in `color` and outlined with dashes.
+pub fn draw_outline(painter: &egui::Painter, rect: Rect, color: Color32) {
+    painter.rect_filled(rect, 6.0, color.gamma_multiply(0.10));
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    painter.extend(Shape::dashed_line(
+        &corners,
+        Stroke::new(2.0, color),
+        6.0,
+        4.0,
+    ));
 }
 
 struct Colors {
     background: Color32,
     grid: Color32,
     text: Color32,
+    /// The cursor readout's values.
+    strong: Color32,
     /// Behind grid labels and the legend, so they read over a dense trace.
     pill: Color32,
     pill_hover: Color32,
-    line: Color32,
-    box_fill: Color32,
+    cursor: Color32,
+    separator: Color32,
 }
 
 impl Colors {
-    fn of(visuals: &egui::Visuals, line: Color32) -> Colors {
-        let box_fill = line.gamma_multiply(0.12);
+    fn of(visuals: &egui::Visuals) -> Colors {
         if visuals.dark_mode {
             Colors {
                 background: Color32::from_gray(22),
                 grid: Color32::from_gray(44),
                 text: Color32::from_gray(150),
+                strong: Color32::from_gray(225),
                 pill: Color32::from_rgba_unmultiplied(22, 22, 22, 190),
                 pill_hover: Color32::from_rgba_unmultiplied(44, 44, 44, 230),
-                line,
-                box_fill,
+                cursor: Color32::from_gray(120),
+                separator: Color32::from_gray(60),
             }
         } else {
             Colors {
                 background: Color32::WHITE,
                 grid: Color32::from_gray(230),
                 text: Color32::from_gray(110),
+                strong: Color32::from_gray(25),
                 pill: Color32::from_rgba_unmultiplied(255, 255, 255, 190),
                 pill_hover: Color32::from_rgba_unmultiplied(236, 236, 236, 235),
-                line,
-                box_fill,
+                cursor: Color32::from_gray(140),
+                separator: Color32::from_gray(215),
             }
         }
     }
@@ -569,10 +1086,12 @@ struct Grid {
     mapping: Mapping,
     time_lines: Vec<(f32, String)>,
     value_lines: Vec<(f32, String)>,
+    /// Draw the time labels: only one panel does.
+    time_labels: bool,
 }
 
 impl Grid {
-    fn new(mapping: &Mapping, unit: &str) -> Grid {
+    fn new(mapping: &Mapping, unit: &str, time_labels: bool) -> Grid {
         let view = mapping.view;
         let axis = ticks::time_axis(view.time, mapping.along_px(), MIN_PX_PER_TIME_TICK);
         let time_lines = ticks::ticks(view.time.from, view.time.to, axis.step_s)
@@ -598,6 +1117,7 @@ impl Grid {
             mapping: *mapping,
             time_lines,
             value_lines,
+            time_labels,
         }
     }
 
@@ -625,17 +1145,19 @@ impl Grid {
         let font = FontId::proportional(11.0);
         // Time labels: left edge when vertical, bottom edge when horizontal.
         // Value labels: top edge when vertical, left edge when horizontal.
-        for (along, label) in &self.time_lines {
-            let (pos, anchor) = match self.mapping.orientation {
-                Orientation::Vertical => {
-                    (pos2(rect.min.x + 4.0, along + 2.0), egui::Align2::LEFT_TOP)
-                }
-                Orientation::Horizontal => (
-                    pos2(along + 3.0, rect.max.y - 2.0),
-                    egui::Align2::LEFT_BOTTOM,
-                ),
-            };
-            label_with_pill(painter, pos, anchor, label, &font, colors);
+        if self.time_labels {
+            for (along, label) in &self.time_lines {
+                let (pos, anchor) = match self.mapping.orientation {
+                    Orientation::Vertical => {
+                        (pos2(rect.min.x + 4.0, along + 2.0), egui::Align2::LEFT_TOP)
+                    }
+                    Orientation::Horizontal => (
+                        pos2(along + 3.0, rect.max.y - 2.0),
+                        egui::Align2::LEFT_BOTTOM,
+                    ),
+                };
+                label_with_pill(painter, pos, anchor, label, &font, colors, colors.pill);
+            }
         }
         for (across, label) in &self.value_lines {
             let (pos, anchor) = match self.mapping.orientation {
@@ -647,7 +1169,7 @@ impl Grid {
                     egui::Align2::LEFT_BOTTOM,
                 ),
             };
-            label_with_pill(painter, pos, anchor, label, &font, colors);
+            label_with_pill(painter, pos, anchor, label, &font, colors, colors.pill);
         }
     }
 }
@@ -659,10 +1181,11 @@ fn label_with_pill(
     text: &str,
     font: &FontId,
     colors: &Colors,
+    fill: Color32,
 ) {
     let galley = painter.layout_no_wrap(text.to_string(), font.clone(), colors.text);
     let rect = anchor.anchor_size(pos, galley.size());
-    painter.rect_filled(rect.expand2(Vec2::new(3.0, 1.0)), 3.0, colors.pill);
+    painter.rect_filled(rect.expand2(Vec2::new(3.0, 1.0)), 3.0, fill);
     painter.galley(rect.min, galley, colors.text);
 }
 

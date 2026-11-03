@@ -34,8 +34,8 @@
 | **Mode** | The mouse tool: Pan (default), Align, Box. A segment control at the bottom; keys 1/2/3 are accelerators. Arrow keys pan in Pan and Box; Align keeps them for nudging. |
 | **Flick** | A pan released while still moving. The view coasts with speed decaying as `e^(−t/0.5 s)` (in code, `Inertia`) until it comes to rest; a tap stops it. The OS's own momentum events are ignored. |
 | **Animation** | A jump of the view (zoom key, wheel notch, autoscale, box) eases out over 150 ms (in code, `Tween`). The next direct gesture interrupts it where it is. |
-| **Legend** | The chip in the plot's free corner with a channel's colour and name. Double-click fits the whole signal. |
-| **Channel palette** | The fixed colours channels are drawn in, by their place in the recording, each with a light-theme and a dark-theme shade. |
+| **Legend** | The chips in a panel's free corner, one per channel, with its colour and name and, under the cursor, its nearest sample's value and stamp. Double-click fits that channel's whole signal; dragging a chip moves its channel to another panel, or back to the tree to remove it. |
+| **Channel palette** | The fixed colours channels are drawn in, by their place in the tree across every open recording (so the same channel of two recordings differs on an overlay), each with a light-theme and a dark-theme shade. |
 | **Align** | The mode where the active stream is dragged directly on the plot: along time = shift, Shift+along = k anchored under the cursor, across = offset, Shift+across = gain anchored under the cursor. |
 | **Drag anchor** | The point under the cursor that stays fixed while stretching in Align. |
 | **Box** | The mode that draws a rectangle and autoscales to it on release. |

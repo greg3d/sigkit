@@ -42,6 +42,11 @@ impl Span {
         self.to - self.from
     }
 
+    /// A fraction `u` of the way from `a` to `b`, each end in a straight line.
+    pub fn lerp(a: Span, b: Span, u: f64) -> Span {
+        Span::new(a.from + (b.from - a.from) * u, a.to + (b.to - a.to) * u)
+    }
+
     pub fn shifted(&self, by: f64) -> Span {
         Span::new(self.from + by, self.to + by)
     }
@@ -73,11 +78,9 @@ impl View {
     /// span moving in a straight line. A zoom about a point keeps that point
     /// fixed all the way.
     pub fn lerp(a: View, b: View, u: f64) -> View {
-        let span =
-            |a: Span, b: Span| Span::new(a.from + (b.from - a.from) * u, a.to + (b.to - a.to) * u);
         View {
-            time: span(a.time, b.time),
-            value: span(a.value, b.value),
+            time: Span::lerp(a.time, b.time, u),
+            value: Span::lerp(a.value, b.value, u),
         }
     }
 }

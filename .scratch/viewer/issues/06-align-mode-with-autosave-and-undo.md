@@ -4,11 +4,15 @@
 
 **Blocked by:** 03 (Motion and look), 05 (Sidebar, panels, overlay, cursor, and multiple recordings)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The `pair` preset's two recordings can be brought into visible phase by drag alone, and the resulting `k` and `shift` match the generator's injected drift and shift within a sample
-- [ ] The anchor point under the cursor stays fixed on screen during a stretch
-- [ ] Typing a value into a field moves the stream exactly; arrows nudge as specified
-- [ ] After every change `header.json` on disk holds the new values; the column files' bytes and mtimes are unchanged
-- [ ] `Cmd+Z` restores the previous values on screen and on disk, step by step
-- [ ] Align works in both orientations without re-mapping any gesture
+- [x] The `pair` preset's two recordings can be brought into visible phase by drag alone, and the resulting `k` and `shift` match the generator's injected drift and shift within a sample
+- [x] The anchor point under the cursor stays fixed on screen during a stretch
+- [x] Typing a value into a field moves the stream exactly; arrows nudge as specified
+- [x] After every change `header.json` on disk holds the new values; the column files' bytes and mtimes are unchanged
+- [x] `Cmd+Z` restores the previous values on screen and on disk, step by step
+- [x] Align works in both orientations without re-mapping any gesture
+
+## Comments
+
+- 2026-11-08: implemented in 750a6de; closed at the owner's request.

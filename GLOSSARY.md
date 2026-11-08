@@ -44,7 +44,8 @@
 | **Undo** | `Cmd+Z` takes back the session's header edits one change at a time, on screen and on disk. A change is a drag, a nudge or a typed field. In code, an `Edit` in the `History`. |
 | **Box** | The mode that draws a rectangle and autoscales to it on release. |
 | **Autoscale** | Fit the value axis to: the visible window, the whole signal, or a box. |
-| **Workspace** | A `.sigws.json` file: which recordings are open together, panels, orientation, view ranges, mode. Saved explicitly. Not part of any recording. |
+| **Workspace** | A `.sigws.json` file: which recordings are open together, panels, orientation, view ranges, mode. Saved explicitly (`Cmd+S`). Not part of any recording, and holds nothing a header holds. A recording inside the workspace's folder is listed relative to it, one elsewhere by its absolute path. Opening one replaces what is open. |
+| **Missing recording** | A recording a workspace lists that could not be opened. Shown as missing in the tree; its channels are left off the panels; it stays listed when the workspace is saved again. |
 | **Sheet** | The bottom panel that slides up for anything needing input (import, export). Always with a live preview; never a modal dialog. |
 | **Import** | Opening a legacy raw file with no header: the sheet guesses dtype, the user confirms, and a `header.json` is written beside the file. Data is not copied. |
 | **Export** | The explicit command that writes a new fixed-rate recording from a timestamped one: fitted rate, linear interpolation, `NaN` across gaps longer than two nominal intervals. |

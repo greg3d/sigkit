@@ -3005,6 +3005,8 @@ dependencies = [
  "eframe",
  "egui",
  "png",
+ "serde",
+ "serde_json",
  "sigkit-format",
  "tempfile",
 ]

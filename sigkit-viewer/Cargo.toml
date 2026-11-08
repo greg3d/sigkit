@@ -16,6 +16,8 @@ eframe.workspace = true
 egui.workspace = true
 clap.workspace = true
 png = "0.18"
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

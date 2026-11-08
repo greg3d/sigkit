@@ -39,9 +39,11 @@ const NUDGE_PX: f32 = 1.0;
 const SHIFT_NUDGE_PX: f32 = 10.0;
 
 /// The mouse tool. Keys 1, 2, 3 are its accelerators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     /// Drag pans, with inertia (the default).
+    #[default]
     Pan,
     /// Drag the active stream to align it; the arrows nudge it.
     Align,

@@ -11,8 +11,10 @@ const MAX_TIME_SPAN_S: f64 = 1e9;
 
 /// Vertical: time runs top to bottom, value left to right (the default).
 /// Horizontal: time runs left to right, value bottom to top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Orientation {
+    #[default]
     Vertical,
     Horizontal,
 }

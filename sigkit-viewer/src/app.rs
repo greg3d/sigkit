@@ -3,7 +3,9 @@
 //! the cursor readout, the status line and the key hints. In Align a sidebar
 //! on the right holds the active stream's corrections as fields; every
 //! change is written to the recording's header at once and `Cmd+Z` takes it
-//! back. Pyramids are built
+//! back. The whole comparison (recordings, panels, orientation, time and
+//! value spans, mode) is saved as a workspace with `Cmd+S` and reopened by
+//! dropping the `.sigws.json` on the window. Pyramids are built
 //! on a background thread so a first open of a huge recording shows progress
 //! instead of a frozen window.
 
@@ -12,6 +14,7 @@ use crate::layout::{ChannelRef, Dragged, Drop, Layout};
 use crate::plot::{self, AlignDrag, Mode, PlotState, Series, Shown};
 use crate::trace::{Clock, Placement, Trace, Values};
 use crate::view::{Orientation, Span};
+use crate::workspace::{self, Found, Opened, Restored, Session, Workspace};
 use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use egui::{
     Align, Color32, ColorImage, Context, DragAndDrop, FontData, FontFamily, FontId, Id, Key,
@@ -76,6 +79,49 @@ pub struct App {
     drag: Option<DragStart>,
     /// The Align field being typed into, and what is typed so far.
     typing: Option<(Field, String)>,
+    /// The workspace file this session was opened from or last saved to.
+    workspace: Option<PathBuf>,
+    /// What was last saved to or opened from `workspace`, to tell whether
+    /// the session has changed since.
+    saved: Option<Workspace>,
+    /// Recordings a workspace lists that could not be opened.
+    missing: Vec<Missing>,
+    /// A workspace being opened: laid out once its recordings have opened.
+    restoring: Option<Restoring>,
+    /// The save sheet, while it is up.
+    sheet: Option<SaveSheet>,
+}
+
+/// A recording a workspace lists that could not be opened: shown in the tree
+/// and kept in the workspace when it is saved again.
+struct Missing {
+    path: PathBuf,
+    reason: String,
+}
+
+/// A workspace whose recordings are opening.
+struct Restoring {
+    workspace: Workspace,
+    /// What became of each of the workspace's recordings.
+    slots: Vec<Slot>,
+}
+
+/// One of a workspace's recordings while the workspace opens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Slot {
+    Opening,
+    /// Open, at this index among the open recordings.
+    Open(usize),
+    Missing,
+    /// Listed again: the same recording as this earlier slot.
+    SameAs(usize),
+}
+
+/// The sheet that asks where to save the workspace.
+struct SaveSheet {
+    path: String,
+    /// Put the keyboard in the field on the next frame.
+    focus: bool,
 }
 
 /// Where an Align drag started: the active channel's corrections then, and
@@ -115,6 +161,8 @@ struct Screenshot {
 /// A recording being opened on a background thread.
 struct Loading {
     path: PathBuf,
+    /// The recording's place in a workspace being opened.
+    slot: Option<usize>,
     rx: mpsc::Receiver<Result<Loaded, String>>,
     progress: Arc<Progress>,
 }
@@ -293,12 +341,31 @@ impl App {
             history: History::default(),
             drag: None,
             typing: None,
+            workspace: None,
+            saved: None,
+            missing: Vec::new(),
+            restoring: None,
+            sheet: None,
         };
         app.plot.pinned_cursor = options.cursor;
-        for path in options.recordings {
-            app.start_load(path);
-        }
+        app.open_paths(options.recordings);
         app
+    }
+
+    /// Open what was passed or dropped: a workspace in place of what is open,
+    /// then the recordings, which join it.
+    fn open_paths(&mut self, paths: Vec<PathBuf>) {
+        let (workspaces, recordings): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| workspace::is_workspace(p));
+        if let Some(file) = workspaces.first() {
+            self.open_workspace(file);
+        }
+        for file in workspaces.iter().skip(1) {
+            self.report(format!("{}: one workspace at a time", file.display()));
+        }
+        for path in recordings {
+            self.start_load(path, None);
+        }
     }
 
     fn entry(&self, channel: ChannelRef) -> &Entry {
@@ -324,7 +391,9 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
-        if self.recordings.is_empty() || !self.loading.is_empty() || self.plot.is_moving() {
+        let nothing = self.recordings.is_empty() && self.missing.is_empty();
+        if nothing || !self.loading.is_empty() || self.restoring.is_some() || self.plot.is_moving()
+        {
             return;
         }
         shot.frames_drawn += 1;
@@ -355,7 +424,9 @@ impl App {
         });
     }
 
-    fn start_load(&mut self, path: PathBuf) {
+    /// Open a recording on a background thread; `slot` is its place in a
+    /// workspace being opened.
+    fn start_load(&mut self, path: PathBuf, slot: Option<usize>) {
         // One recording by any spelling of its path is open once.
         let path = path.canonicalize().unwrap_or(path);
         let open = self.recordings.iter().map(|r| &r.path);
@@ -364,6 +435,7 @@ impl App {
             .any(|p| *p == path)
         {
             self.report(format!("{}: already open", path.display()));
+            self.fill_slot(slot, Slot::Missing);
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -373,7 +445,233 @@ impl App {
             let (path, progress) = worker;
             let _ = tx.send(load(&path, &progress));
         });
-        self.loading.push(Loading { path, rx, progress });
+        self.loading.push(Loading {
+            path,
+            slot,
+            rx,
+            progress,
+        });
+    }
+
+    /// What became of the workspace recording `slot`.
+    fn fill_slot(&mut self, slot: Option<usize>, to: Slot) {
+        if let (Some(slot), Some(restoring)) = (slot, &mut self.restoring) {
+            restoring.slots[slot] = to;
+        }
+    }
+
+    /// A recording could not be opened, for `reason` (which names it):
+    /// missing from a workspace, or said.
+    fn failed(&mut self, path: PathBuf, slot: Option<usize>, reason: String) {
+        if slot.is_some() {
+            self.missing.push(Missing { path, reason });
+            self.fill_slot(slot, Slot::Missing);
+        } else {
+            self.report(reason);
+        }
+    }
+
+    /// Open the workspace at `file` in place of everything open now. Its
+    /// recordings open in the background; the panels follow once they have.
+    fn open_workspace(&mut self, file: &Path) {
+        let (workspace, paths) = match read_workspace(file) {
+            Ok(read) => read,
+            Err(e) => return self.report(e),
+        };
+        self.recordings.clear();
+        self.loading.clear();
+        self.missing.clear();
+        self.layout = Layout::default();
+        self.history = History::default();
+        self.refit.clear();
+        self.drag = None;
+        self.typing = None;
+        self.sheet = None;
+        self.initial_time = None;
+        self.initial_channel = None;
+        self.plot.active = None;
+        self.plot.let_go();
+        self.plot.interrupt();
+        self.workspace = Some(canonical_file(file));
+        self.saved = Some(workspace.clone());
+        // A recording listed twice opens once; both places show it.
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .collect();
+        let slots = (0..paths.len())
+            .map(|i| match paths[..i].iter().position(|p| *p == paths[i]) {
+                Some(first) => Slot::SameAs(first),
+                None => Slot::Opening,
+            })
+            .collect();
+        self.restoring = Some(Restoring { slots, workspace });
+        for (slot, path) in paths.into_iter().enumerate() {
+            if self.restoring.as_ref().expect("just set").slots[slot] == Slot::Opening {
+                self.start_load(path, Some(slot));
+            }
+        }
+    }
+
+    /// Lay out a workspace once every one of its recordings has opened or
+    /// failed to.
+    fn finish_restoring(&mut self, ctx: &Context) {
+        let Some(restoring) = &self.restoring else {
+            return;
+        };
+        let Some(slots) = opened(&restoring.slots) else {
+            return;
+        };
+        let restoring = self.restoring.take().expect("checked");
+        let Restored {
+            layout,
+            time,
+            orientation,
+            mode,
+            problems,
+        } = restore(&restoring.workspace, &self.recordings, &slots);
+        self.layout = layout;
+        self.plot.time = time
+            .or_else(|| {
+                self.recordings
+                    .first()?
+                    .entries
+                    .first()?
+                    .trace()
+                    .display_span()
+            })
+            .unwrap_or(Span::new(0.0, 1.0));
+        self.plot.orientation = orientation;
+        self.plot.mode = mode;
+        self.plot.interrupt();
+        for problem in problems {
+            self.report(problem);
+        }
+        // What opened is unchanged until the user changes it, even where it
+        // differs from the file (a missing recording's channels left out).
+        if let Some(file) = &self.workspace {
+            self.saved = Some(self.captured(file));
+        }
+        self.update_title(ctx);
+    }
+
+    /// The window's title: the workspace's name, or the open recordings'.
+    fn update_title(&self, ctx: &Context) {
+        let title = match &self.workspace {
+            Some(file) => file_name(file),
+            None => {
+                let names: Vec<&str> = self.recordings.iter().map(|r| r.name.as_str()).collect();
+                names.join(", ")
+            }
+        };
+        ctx.send_viewport_cmd(ViewportCommand::Title(format!("{title} — sigkit")));
+    }
+
+    /// The workspace of the session as it is now, as it would be saved at
+    /// `file`.
+    fn captured(&self, file: &Path) -> Workspace {
+        Workspace::capture(
+            file,
+            &session(&self.recordings, &self.missing, &self.layout, &self.plot),
+        )
+    }
+
+    /// Save the workspace at `file`, which becomes the session's.
+    fn save_workspace(&mut self, file: PathBuf) {
+        if !self.loading.is_empty() || self.restoring.is_some() {
+            return self.report("wait for the recordings to open before saving".into());
+        }
+        match write_workspace(
+            &file,
+            &self.recordings,
+            &self.missing,
+            &self.layout,
+            &self.plot,
+        ) {
+            Ok(file) => {
+                self.saved = Some(self.captured(&file));
+                self.workspace = Some(file);
+                self.sheet = None;
+            }
+            Err(e) => self.report(e),
+        }
+    }
+
+    /// `Cmd+S`: save to the session's workspace, or ask where with the sheet.
+    /// `Cmd+Shift+S` always asks.
+    fn save(&mut self, ask: bool) {
+        match &self.workspace {
+            Some(file) if !ask => self.save_workspace(file.clone()),
+            _ => {
+                let path = self.workspace.clone().unwrap_or_else(|| {
+                    let first = self.recordings.first().map(|r| r.path.as_path());
+                    default_workspace_path(first)
+                });
+                self.sheet = Some(SaveSheet {
+                    path: path.display().to_string(),
+                    focus: true,
+                });
+            }
+        }
+    }
+
+    /// The save sheet: where the workspace goes, Enter saves, Escape closes.
+    fn save_sheet(&mut self, ui: &mut egui::Ui) {
+        let Some(sheet) = &mut self.sheet else {
+            return;
+        };
+        let mut save = false;
+        let mut close = false;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.strong("Save workspace");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut sheet.path)
+                    .desired_width(ui.available_width() - 160.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            if std::mem::take(&mut sheet.focus) {
+                response.request_focus();
+            }
+            if response.lost_focus() {
+                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                    save = true;
+                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    close = true;
+                }
+            }
+            save |= ui.button("Save  ⏎").clicked();
+            close |= ui.button("Cancel  esc").clicked();
+        });
+        // What the file would list, as typed: relative inside its folder.
+        let weak = ui.visuals().weak_text_color();
+        let file = canonical_file(&with_extension(&sheet.path));
+        let session = session(&self.recordings, &self.missing, &self.layout, &self.plot);
+        for listed in Workspace::capture(&file, &session).recordings {
+            let how = if listed.is_absolute() {
+                "absolute: outside the folder"
+            } else {
+                "relative: moves with the folder"
+            };
+            ui.label(
+                egui::RichText::new(format!("{}    {how}", listed.display()))
+                    .small()
+                    .monospace()
+                    .color(weak),
+            );
+        }
+        ui.label(
+            egui::RichText::new("corrections and calibration stay in each recording's header")
+                .small()
+                .color(weak),
+        );
+        ui.add_space(6.0);
+        if save {
+            let path = with_extension(&sheet.path);
+            self.save_workspace(path);
+        } else if close {
+            self.sheet = None;
+        }
     }
 
     /// Take finished recordings in the order they were asked for.
@@ -381,22 +679,30 @@ impl App {
         while let Some(loading) = self.loading.first() {
             match loading.rx.try_recv() {
                 Ok(Ok(loaded)) => {
-                    self.loading.remove(0);
-                    self.add_recording(ctx, loaded);
+                    let slot = self.loading.remove(0).slot;
+                    if slot.is_some() {
+                        self.recordings.push(loaded);
+                        self.fill_slot(slot, Slot::Open(self.recordings.len() - 1));
+                    } else {
+                        self.add_recording(ctx, loaded);
+                    }
                 }
-                Ok(Err(message)) => {
-                    self.loading.remove(0);
-                    self.report(message);
+                Ok(Err(reason)) => {
+                    let Loading { path, slot, .. } = self.loading.remove(0);
+                    self.failed(path, slot, reason);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint_after(Duration::from_millis(50));
-                    return;
+                    break;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    let path = self.loading.remove(0).path;
-                    self.report(format!("{}: opening failed", path.display()));
+                    let Loading { path, slot, .. } = self.loading.remove(0);
+                    let reason = format!("{}: opening failed", path.display());
+                    self.failed(path, slot, reason);
                 }
             }
+            // Before any recording queued after the workspace's joins it.
+            self.finish_restoring(ctx);
         }
     }
 
@@ -452,11 +758,7 @@ impl App {
             value,
         );
         self.plot.interrupt();
-        let names: Vec<&str> = self.recordings.iter().map(|r| r.name.as_str()).collect();
-        ctx.send_viewport_cmd(ViewportCommand::Title(format!(
-            "{} — sigkit",
-            names.join(", ")
-        )));
+        self.update_title(ctx);
     }
 
     /// The mode as a segment control, with its key on each segment.
@@ -512,6 +814,9 @@ impl App {
                     }
                 });
         }
+        for missing in &self.missing {
+            missing_row(ui, missing, weak);
+        }
         if let Some(channel) = toggled {
             let entry = &mut self.recordings[channel.recording].entries[channel.entry];
             entry.subtract_fit = !entry.subtract_fit;
@@ -520,7 +825,7 @@ impl App {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "drag a channel onto the plot  ·  drop a .sigrec on the window to add it",
+                "drag a channel onto the plot  ·  drop a .sigrec on the window to add it, a .sigws.json to open a workspace  ·  ⌘S saves the workspace, ⇧⌘S somewhere else",
             )
             .small()
             .color(weak),
@@ -576,7 +881,19 @@ impl App {
             let built: usize = self.recordings.iter().map(|r| r.built).sum();
             let took: Duration = self.recordings.iter().map(|r| r.took).sum();
             let panels = self.layout.panels().len();
-            let mut text = format!(
+            let mut text = match &self.workspace {
+                Some(file) => {
+                    let changed = self.saved.as_ref() != Some(&self.captured(file));
+                    let state = if changed {
+                        "changed since saved"
+                    } else {
+                        "saved"
+                    };
+                    format!("{} ({state})  ·  ", file_name(file))
+                }
+                None => String::new(),
+            };
+            text += &format!(
                 "{}  ·  {panels} panel{}  ·  {pyramids} pyramids, {built} built, in {:.0} ms  ·  plot {:.1} ms",
                 names.join(", "),
                 if panels == 1 { "" } else { "s" },
@@ -588,8 +905,8 @@ impl App {
                 text.push_str(problem);
             }
             ui.weak(text);
-        } else {
-            ui.weak("drop a .sigrec recording here, or pass it on the command line");
+        } else if self.missing.is_empty() {
+            ui.weak("drop a .sigrec recording or a .sigws.json workspace here, or pass it on the command line");
         }
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -944,11 +1261,15 @@ impl eframe::App for App {
             // A new drop: the last one's errors have been read.
             self.error = None;
         }
-        for path in dropped {
-            self.start_load(path);
-        }
+        self.open_paths(dropped);
         // Keys typed into a field are the field's.
         if !ctx.egui_wants_keyboard_input() {
+            let save = ctx.input(|i| {
+                (i.modifiers.command && i.key_pressed(Key::S)).then_some(i.modifiers.shift)
+            });
+            if let Some(ask) = save {
+                self.save(ask);
+            }
             let undo = ctx.input(|i| {
                 if i.key_pressed(Key::O) {
                     self.plot.orientation = self.plot.orientation.toggled();
@@ -984,6 +1305,9 @@ impl eframe::App for App {
             ui.horizontal(|ui| ui.weak(hints(self.plot.mode)));
             ui.add_space(2.0);
         });
+        if self.sheet.is_some() {
+            egui::Panel::bottom("save sheet").show(ui, |ui| self.save_sheet(ui));
+        }
         let tree = egui::Panel::left("tree")
             .resizable(false)
             .exact_size(TREE_WIDTH)
@@ -1473,6 +1797,166 @@ fn load_stream(
     Ok(())
 }
 
+/// Each workspace recording's index among the open recordings, `None` when
+/// it is missing; `None` overall while any is still opening.
+fn opened(slots: &[Slot]) -> Option<Vec<Option<usize>>> {
+    slots
+        .iter()
+        .map(|&slot| match slot {
+            Slot::Opening => None,
+            Slot::Open(index) => Some(Some(index)),
+            Slot::Missing => Some(None),
+            Slot::SameAs(first) => match slots[first] {
+                Slot::Opening => None,
+                Slot::Open(index) => Some(Some(index)),
+                _ => Some(None),
+            },
+        })
+        .collect()
+}
+
+/// A recording a workspace lists that could not be opened: its name, marked
+/// missing, and why on hover.
+fn missing_row(ui: &mut egui::Ui, missing: &Missing, weak: Color32) {
+    let response = ui
+        .horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(file_name(&missing.path))
+                    .strong()
+                    .color(weak),
+            );
+            ui.label(
+                egui::RichText::new("missing")
+                    .small()
+                    .color(ui.visuals().error_fg_color),
+            );
+        })
+        .response;
+    response.on_hover_text(format!("{}\n{}", missing.path.display(), missing.reason));
+}
+
+/// A path's last component, for showing.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// A typed workspace path, ending in the workspace extension.
+fn with_extension(typed: &str) -> PathBuf {
+    let mut path = typed.trim().to_string();
+    if !path.ends_with(workspace::EXTENSION) {
+        path.push_str(workspace::EXTENSION);
+    }
+    PathBuf::from(path)
+}
+
+/// `file` with its folder spelt canonically, so recording paths (canonical
+/// once opened) can be told to be inside it.
+fn canonical_file(file: &Path) -> PathBuf {
+    let dir = match file.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    match (dir.canonicalize(), file.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name),
+        _ => file.to_path_buf(),
+    }
+}
+
+/// Where the save sheet suggests a new workspace goes: beside the first
+/// recording, named after it.
+fn default_workspace_path(first: Option<&Path>) -> PathBuf {
+    let Some(first) = first else {
+        return PathBuf::from(format!("workspace{}", workspace::EXTENSION));
+    };
+    let stem = first
+        .file_stem()
+        .map_or_else(|| "workspace".into(), |s| s.to_string_lossy().into_owned());
+    first.with_file_name(format!("{stem}{}", workspace::EXTENSION))
+}
+
+/// What a workspace is taken from.
+fn session<'a>(
+    recordings: &'a [Loaded],
+    missing: &'a [Missing],
+    layout: &'a Layout,
+    plot: &PlotState,
+) -> Session<'a> {
+    Session {
+        opened: recordings
+            .iter()
+            .map(|r| Opened {
+                path: &r.path,
+                entries: entry_ids(r),
+            })
+            .collect(),
+        missing: missing.iter().map(|m| m.path.as_path()).collect(),
+        layout,
+        time: plot.time,
+        orientation: plot.orientation,
+        mode: plot.mode,
+    }
+}
+
+/// A recording's entries as `(stream, channel)`.
+fn entry_ids(loaded: &Loaded) -> Vec<(&str, &str)> {
+    loaded
+        .entries
+        .iter()
+        .map(|e| (e.stream.as_str(), e.channel.as_str()))
+        .collect()
+}
+
+/// Write the workspace of the session at `file`, atomically; the file as
+/// the session now knows it.
+fn write_workspace(
+    file: &Path,
+    recordings: &[Loaded],
+    missing: &[Missing],
+    layout: &Layout,
+    plot: &PlotState,
+) -> Result<PathBuf, String> {
+    let file = canonical_file(file);
+    let workspace = Workspace::capture(&file, &session(recordings, missing, layout, plot));
+    sigkit_format::write_atomic(&file, workspace.to_json().as_bytes())
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(file)
+}
+
+/// Read the workspace at `file`, and where each of its recordings is.
+fn read_workspace(file: &Path) -> Result<(Workspace, Vec<PathBuf>), String> {
+    let said = |e: String| format!("{}: {e}", file.display());
+    let text = std::fs::read_to_string(file).map_err(|e| said(e.to_string()))?;
+    let workspace = Workspace::parse(&text).map_err(said)?;
+    let paths = workspace.recording_paths(&canonical_file(file));
+    Ok((workspace, paths))
+}
+
+/// Lay `workspace` onto the recordings that opened: `slots[i]` is the index
+/// among `recordings` of its `i`-th recording, `None` when it is missing. A
+/// panel without a value span kept is fitted to its channels in the time
+/// shown.
+fn restore(workspace: &Workspace, recordings: &[Loaded], slots: &[Option<usize>]) -> Restored {
+    let found: Vec<Option<Found>> = slots
+        .iter()
+        .map(|slot| {
+            slot.map(|index| Found {
+                index,
+                entries: entry_ids(&recordings[index]),
+            })
+        })
+        .collect();
+    let time = workspace.time();
+    workspace.restore(&found, |channels| {
+        let traces = channels.iter().map(|&c| entry(recordings, c).trace());
+        plot::fitted_value(traces.clone(), time)
+            .or_else(|| plot::fitted_value(traces, None))
+            .unwrap_or(Span::new(-1.0, 1.0))
+    })
+}
+
 fn save_png(path: &Path, image: &ColorImage) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     let [width, height] = image.size;
@@ -1614,6 +2098,120 @@ mod tests {
         }
         assert_eq!(span(&loaded, 0).from, 0.0);
         assert_eq!(columns(&dir), before, "column bytes and mtimes");
+    }
+
+    /// A layout's panels as their channels' labels and value spans.
+    fn laid_out(recordings: &[Loaded], layout: &Layout) -> Vec<(Vec<String>, Span)> {
+        layout
+            .panels()
+            .iter()
+            .map(|p| {
+                let labels = p.channels.iter().map(|&c| label(recordings, c).into());
+                (labels.collect(), p.value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_saved_workspace_reopens_as_left_after_its_folder_moves_and_without_a_missing_recording() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let pair = synth::pair(&PairSpec {
+            name: "pair".into(),
+            rate_nominal_hz: 100.0,
+            duration_s: 10.0,
+            jitter_s: 0.0,
+            drop_fraction: 0.0,
+            ppm_a: 0.0,
+            ppm_b: 100.0,
+            shift_s: 0.25,
+            signal: Signal::default(),
+            seed: 1,
+        });
+        let folder = root.join("w");
+        let paths = ["a", "b"].map(|n| folder.join("data").join(format!("pair-{n}.sigrec")));
+        for (recording, path) in pair.iter().zip(&paths) {
+            recording.write(path).unwrap();
+        }
+        let recordings: Vec<Loaded> = paths.iter().map(|p| opened(p)).collect();
+        // a's value and b's value overlaid, a's residual alone; entry 1 is a
+        // residual.
+        let ch = |recording, entry| ChannelRef { recording, entry };
+        let mut layout = Layout::default();
+        let from_tree = |channel| Dragged {
+            channel,
+            from: None,
+        };
+        layout.drop(from_tree(ch(0, 0)), Drop::NewPanel(0), Span::new(-2.0, 2.0));
+        layout.drop(from_tree(ch(1, 0)), Drop::Overlay(0), Span::new(-2.0, 2.0));
+        layout.drop(from_tree(ch(0, 1)), Drop::NewPanel(1), Span::new(-0.1, 0.1));
+        let mut plot = PlotState::new(Span::new(1.0, 3.0), Orientation::Horizontal);
+        plot.mode = Mode::Align;
+        let before = laid_out(&recordings, &layout);
+        let headers = paths
+            .clone()
+            .map(|p| std::fs::read(p.join("header.json")).unwrap());
+
+        let file = folder.join("pair.sigws.json");
+        write_workspace(&file, &recordings, &[], &layout, &plot).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(r#""data/pair-a.sigrec""#), "{text}");
+        for header_fact in ["gain", "offset", "\"k\"", "shift", "rate", "unit"] {
+            assert!(!text.contains(header_fact), "{header_fact} in {text}");
+        }
+        for (path, header) in paths.iter().zip(&headers) {
+            assert_eq!(&std::fs::read(path.join("header.json")).unwrap(), header);
+        }
+
+        // The folder moves as a whole; the workspace still finds everything.
+        let moved = root.join("moved");
+        std::fs::rename(&folder, &moved).unwrap();
+        let file = moved.join("pair.sigws.json");
+        let reopen = |file: &Path| {
+            let (ws, paths) = read_workspace(file).unwrap();
+            let mut recordings = Vec::new();
+            let mut missing = Vec::new();
+            let mut slots = Vec::new();
+            for path in paths {
+                match load(&path, &Progress::default()) {
+                    Ok(loaded) => {
+                        slots.push(Some(recordings.len()));
+                        recordings.push(loaded);
+                    }
+                    Err(reason) => {
+                        slots.push(None);
+                        missing.push(Missing { path, reason });
+                    }
+                }
+            }
+            let restored = restore(&ws, &recordings, &slots);
+            (recordings, missing, restored)
+        };
+        let (recordings, missing, restored) = reopen(&file);
+        assert!(missing.is_empty());
+        assert_eq!(laid_out(&recordings, &restored.layout), before);
+        assert_eq!(restored.time, Some(Span::new(1.0, 3.0)));
+        assert_eq!(restored.orientation, Orientation::Horizontal);
+        assert_eq!(restored.mode, Mode::Align);
+        assert!(restored.problems.is_empty(), "{:?}", restored.problems);
+
+        // Without b, a's channels come back, b is missing and a save keeps it.
+        std::fs::remove_dir_all(moved.join("data/pair-b.sigrec")).unwrap();
+        let (recordings, missing, restored) = reopen(&file);
+        assert_eq!(recordings.len(), 1);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].path, moved.join("data/pair-b.sigrec"));
+        assert_eq!(
+            laid_out(&recordings, &restored.layout),
+            vec![
+                (vec!["signal/value".to_string()], Span::new(-2.0, 2.0)),
+                (vec!["signal/residual".to_string()], Span::new(-0.1, 0.1)),
+            ]
+        );
+        write_workspace(&file, &recordings, &missing, &restored.layout, &plot).unwrap();
+        let (ws, _) = read_workspace(&file).unwrap();
+        let listed: Vec<PathBuf> = vec!["data/pair-a.sigrec".into(), "data/pair-b.sigrec".into()];
+        assert_eq!(ws.recordings, listed);
     }
 
     #[test]

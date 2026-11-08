@@ -17,6 +17,7 @@ pub mod residual;
 pub mod synth;
 pub mod wallclock;
 
+pub use atomic::write_atomic;
 pub use column::{Column, Dtype};
 pub use error::{Error, Result};
 pub use header::{

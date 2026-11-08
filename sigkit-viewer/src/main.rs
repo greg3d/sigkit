@@ -9,6 +9,7 @@ mod plot;
 mod ticks;
 mod trace;
 mod view;
+mod workspace;
 
 use clap::Parser;
 use std::path::PathBuf;

@@ -8,7 +8,7 @@
 //! Dropped samples are removed at random, so their gaps are whole intervals.
 //! The preset and the injected truth are written to the header under `source`.
 
-use crate::column::{Column, Dtype};
+use crate::column::{ByteOrder, Column, Dtype};
 use crate::header::{Channel, ClockDomain, Header, Stream, UtcAnchor};
 use crate::recording::{Recording, StreamData};
 use crate::wallclock::rfc3339_now;
@@ -100,6 +100,87 @@ pub struct PairSpec {
     pub shift_s: f64,
     pub signal: Signal,
     pub seed: u64,
+}
+
+/// A legacy raw file with no header: `channels` interleaved channels of one
+/// dtype in one byte order, after `header_bytes` of text the reader must skip.
+/// Channel `j` is the signal at `j + 1` times its frequency, so channels
+/// differ. Integer dtypes hold counts: the value times
+/// [`counts_per_unit`], rounded and saturated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSpec {
+    pub dtype: Dtype,
+    pub byte_order: ByteOrder,
+    pub channels: usize,
+    pub header_bytes: usize,
+    pub rate_hz: f64,
+    pub duration_s: f64,
+    pub signal: Signal,
+    pub seed: u64,
+}
+
+impl Default for RawSpec {
+    fn default() -> Self {
+        RawSpec {
+            dtype: Dtype::F32,
+            byte_order: ByteOrder::Little,
+            channels: 1,
+            header_bytes: 0,
+            rate_hz: 100.0,
+            duration_s: 10.0,
+            signal: Signal::default(),
+            seed: 1,
+        }
+    }
+}
+
+/// A generated raw file: its bytes, and each channel's stored values (counts
+/// for an integer dtype), as a reader should decode them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawFile {
+    pub bytes: Vec<u8>,
+    pub channels: Vec<Vec<f64>>,
+}
+
+/// Counts per unit of signal an integer raw file stores: an amplitude of one
+/// spans a sixteenth of an `i16`, a millionth-ish step for wider ones.
+pub fn counts_per_unit(dtype: Dtype) -> f64 {
+    match dtype {
+        Dtype::I16 => 2048.0,
+        Dtype::I32 => 1048576.0,
+        Dtype::I64 => 4294967296.0,
+        Dtype::F32 | Dtype::F64 => 1.0,
+    }
+}
+
+/// A legacy raw file with no header (see [`RawSpec`]).
+pub fn raw(spec: &RawSpec) -> RawFile {
+    const TEXT: &[u8] = b"legacy acquisition header, not samples\n";
+    let mut rng = Rng::new(spec.seed);
+    let n = (spec.duration_s * spec.rate_hz).round() as usize;
+    let scale = counts_per_unit(spec.dtype);
+    let mut bytes: Vec<u8> = TEXT
+        .iter()
+        .copied()
+        .cycle()
+        .take(spec.header_bytes)
+        .collect();
+    let mut channels = vec![Vec::with_capacity(n); spec.channels];
+    for i in 0..n {
+        let t = i as f64 / spec.rate_hz;
+        for (j, values) in channels.iter_mut().enumerate() {
+            let signal = Signal {
+                freq_hz: spec.signal.freq_hz * (j + 1) as f64,
+                ..spec.signal
+            };
+            let encoded = spec
+                .dtype
+                .encode(signal.sample(t, &mut rng) as f64 * scale, spec.byte_order);
+            values.push(spec.dtype.decode(&encoded, spec.byte_order));
+            bytes.extend_from_slice(&encoded);
+        }
+    }
+    RawFile { bytes, channels }
 }
 
 /// A generated recording, in memory: its header and its streams' samples.

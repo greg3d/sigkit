@@ -222,3 +222,31 @@ fn gen_refuses_to_overwrite_and_inspect_reports_a_missing_recording() {
     assert!(!ok);
     assert!(stderr.contains("nope.sigrec"), "{stderr}");
 }
+
+#[test]
+fn gen_raw_writes_a_bare_interleaved_file_with_no_header_of_the_asked_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("legacy.bin");
+    let (ok, stdout, stderr) = sigkit(&[
+        "gen",
+        "raw",
+        out.to_str().unwrap(),
+        "--dtype",
+        "i32",
+        "--channels",
+        "2",
+        "--byte-order",
+        "big",
+        "--header-bytes",
+        "100",
+        "--rate",
+        "50",
+        "--duration",
+        "2",
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("legacy.bin"), "{stdout}");
+    // 100 header bytes, then 100 frames of two 4-byte elements.
+    assert_eq!(std::fs::metadata(&out).unwrap().len(), 100 + 100 * 2 * 4);
+    assert!(!tmp.path().join("header.json").exists());
+}

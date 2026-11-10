@@ -5,7 +5,7 @@
 //! sample is empty and stays a gap at every level until a sibling fills it.
 //! Bins are never averages: a single spike survives to the top level.
 
-use crate::column::Dtype;
+use crate::column::{Dtype, Interleave};
 
 /// Nominal intervals covered by one base bin.
 pub const BASE_BIN_INTERVALS: u32 = 64;
@@ -150,9 +150,12 @@ pub struct Fingerprint {
     pub dtype: Dtype,
     /// Seconds per base bin: 64 nominal intervals.
     pub base_bin_s: f64,
+    /// Where the value column's elements sit in its file.
+    pub interleave: Interleave,
 }
 
-const CACHE_MAGIC: &[u8; 8] = b"SKPYR\x01\0\0";
+/// Version 2 added the value column's interleave.
+const CACHE_MAGIC: &[u8; 8] = b"SKPYR\x02\0\0";
 
 impl Pyramid {
     /// The cache file bytes: magic and version, fingerprint, then every level.
@@ -167,6 +170,11 @@ impl Pyramid {
         }
         out.push(dtype_tag(fingerprint.dtype));
         out.extend_from_slice(&fingerprint.base_bin_s.to_le_bytes());
+        let lane = &fingerprint.interleave;
+        out.extend_from_slice(&lane.offset_bytes.to_le_bytes());
+        out.extend_from_slice(&(lane.frame_bytes as u64).to_le_bytes());
+        out.extend_from_slice(&(lane.lane_bytes as u64).to_le_bytes());
+        out.push(lane.byte_order as u8);
         out.extend_from_slice(&(self.levels.len() as u32).to_le_bytes());
         for level in &self.levels {
             out.extend_from_slice(&(level.len() as u64).to_le_bytes());
@@ -195,6 +203,18 @@ impl Pyramid {
             }
         }
         if r.u8()? != dtype_tag(fingerprint.dtype) || r.f64()? != fingerprint.base_bin_s {
+            return None;
+        }
+        let lane = &fingerprint.interleave;
+        let layout = (r.u64()?, r.u64()?, r.u64()?, r.u8()?);
+        if layout
+            != (
+                lane.offset_bytes,
+                lane.frame_bytes as u64,
+                lane.lane_bytes as u64,
+                lane.byte_order as u8,
+            )
+        {
             return None;
         }
         // Untrusted counts: allocate only what the bytes can actually hold.

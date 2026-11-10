@@ -10,8 +10,10 @@
 //! instead of a frozen window.
 
 use crate::align::{Calibration, Change, Correction, Edit, History, stretch_factor};
+use crate::import::{ImportSheet, Outcome};
 use crate::layout::{ChannelRef, Dragged, Drop, Layout};
 use crate::plot::{self, AlignDrag, Mode, PlotState, Series, Shown};
+use crate::sheet::Sheet;
 use crate::trace::{Clock, Placement, Trace, Values};
 use crate::view::{Orientation, Span};
 use crate::workspace::{self, Found, Opened, Restored, Session, Workspace};
@@ -88,8 +90,10 @@ pub struct App {
     missing: Vec<Missing>,
     /// A workspace being opened: laid out once its recordings have opened.
     restoring: Option<Restoring>,
-    /// The save sheet, while it is up.
-    sheet: Option<SaveSheet>,
+    /// The sheet asking where to save the workspace.
+    sheet: Sheet<SaveSheet>,
+    /// The sheet importing a raw file with no header.
+    import: Sheet<ImportSheet>,
 }
 
 /// A recording a workspace lists that could not be opened: shown in the tree
@@ -122,6 +126,62 @@ struct SaveSheet {
     path: String,
     /// Put the keyboard in the field on the next frame.
     focus: bool,
+}
+
+/// What the save sheet asks of the app.
+enum SaveAction {
+    Save(PathBuf),
+    Cancel,
+}
+
+/// The save sheet: where the workspace goes, and what it would list. Enter
+/// saves.
+fn save_sheet(ui: &mut egui::Ui, sheet: &mut SaveSheet, session: &Session) -> Option<SaveAction> {
+    let mut save = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        ui.strong("Save workspace");
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut sheet.path)
+                .desired_width(ui.available_width() - 160.0)
+                .font(egui::TextStyle::Monospace),
+        );
+        if std::mem::take(&mut sheet.focus) {
+            response.request_focus();
+        }
+        save |= response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        save |= ui.button("Save  ⏎").clicked();
+        cancel |= ui.button("Cancel  esc").clicked();
+    });
+    // What the file would list, as typed: relative inside its folder.
+    let weak = ui.visuals().weak_text_color();
+    let file = canonical_file(&with_extension(&sheet.path));
+    for listed in Workspace::capture(&file, session).recordings {
+        let how = if listed.is_absolute() {
+            "absolute: outside the folder"
+        } else {
+            "relative: moves with the folder"
+        };
+        ui.label(
+            egui::RichText::new(format!("{}    {how}", listed.display()))
+                .small()
+                .monospace()
+                .color(weak),
+        );
+    }
+    ui.label(
+        egui::RichText::new("corrections and calibration stay in each recording's header")
+            .small()
+            .color(weak),
+    );
+    ui.add_space(6.0);
+    if save {
+        Some(SaveAction::Save(with_extension(&sheet.path)))
+    } else if cancel {
+        Some(SaveAction::Cancel)
+    } else {
+        None
+    }
 }
 
 /// Where an Align drag started: the active channel's corrections then, and
@@ -345,7 +405,8 @@ impl App {
             saved: None,
             missing: Vec::new(),
             restoring: None,
-            sheet: None,
+            sheet: Sheet::default(),
+            import: Sheet::default(),
         };
         app.plot.pinned_cursor = options.cursor;
         app.open_paths(options.recordings);
@@ -364,7 +425,22 @@ impl App {
             self.report(format!("{}: one workspace at a time", file.display()));
         }
         for path in recordings {
-            self.start_load(path, None);
+            if path.is_dir() {
+                self.start_load(path, None);
+            } else if let Some(dir) = sigkit_format::raw::recording_of(&path) {
+                // Already imported, or a column of a recording: open that.
+                self.start_load(dir, None);
+            } else if self.import.is_open() {
+                self.report(format!("{}: one import at a time", path.display()));
+            } else {
+                match ImportSheet::new(path) {
+                    Ok(import) => {
+                        self.sheet.close();
+                        self.import.open(import);
+                    }
+                    Err(e) => self.report(e),
+                }
+            }
         }
     }
 
@@ -391,13 +467,16 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
-        let nothing = self.recordings.is_empty() && self.missing.is_empty();
+        let nothing =
+            self.recordings.is_empty() && self.missing.is_empty() && !self.import.is_shown();
         if nothing || !self.loading.is_empty() || self.restoring.is_some() || self.plot.is_moving()
         {
             return;
         }
         shot.frames_drawn += 1;
-        if shot.frames_drawn >= 3 && !shot.requested {
+        // A sheet slides up for a few frames first.
+        let settle = if self.import.is_shown() { 30 } else { 3 };
+        if shot.frames_drawn >= settle && !shot.requested {
             shot.requested = true;
             let (path, saved) = (shot.path.clone(), shot.saved.clone());
             ctx.send_viewport_cmd(ViewportCommand::Screenshot(ScreenshotCallback::new(
@@ -486,7 +565,7 @@ impl App {
         self.refit.clear();
         self.drag = None;
         self.typing = None;
-        self.sheet = None;
+        self.sheet.close();
         self.initial_time = None;
         self.initial_channel = None;
         self.plot.active = None;
@@ -591,7 +670,7 @@ impl App {
             Ok(file) => {
                 self.saved = Some(self.captured(&file));
                 self.workspace = Some(file);
-                self.sheet = None;
+                self.sheet.close();
             }
             Err(e) => self.report(e),
         }
@@ -607,7 +686,8 @@ impl App {
                     let first = self.recordings.first().map(|r| r.path.as_path());
                     default_workspace_path(first)
                 });
-                self.sheet = Some(SaveSheet {
+                self.import.close();
+                self.sheet.open(SaveSheet {
                     path: path.display().to_string(),
                     focus: true,
                 });
@@ -615,62 +695,28 @@ impl App {
         }
     }
 
-    /// The save sheet: where the workspace goes, Enter saves, Escape closes.
-    fn save_sheet(&mut self, ui: &mut egui::Ui) {
-        let Some(sheet) = &mut self.sheet else {
-            return;
-        };
-        let mut save = false;
-        let mut close = false;
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.strong("Save workspace");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut sheet.path)
-                    .desired_width(ui.available_width() - 160.0)
-                    .font(egui::TextStyle::Monospace),
-            );
-            if std::mem::take(&mut sheet.focus) {
-                response.request_focus();
-            }
-            if response.lost_focus() {
-                if ui.input(|i| i.key_pressed(Key::Enter)) {
-                    save = true;
-                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
-                    close = true;
-                }
-            }
-            save |= ui.button("Save  ⏎").clicked();
-            close |= ui.button("Cancel  esc").clicked();
-        });
-        // What the file would list, as typed: relative inside its folder.
-        let weak = ui.visuals().weak_text_color();
-        let file = canonical_file(&with_extension(&sheet.path));
-        let session = session(&self.recordings, &self.missing, &self.layout, &self.plot);
-        for listed in Workspace::capture(&file, &session).recordings {
-            let how = if listed.is_absolute() {
-                "absolute: outside the folder"
-            } else {
-                "relative: moves with the folder"
-            };
-            ui.label(
-                egui::RichText::new(format!("{}    {how}", listed.display()))
-                    .small()
-                    .monospace()
-                    .color(weak),
-            );
+    /// The sheets at the bottom: saving the workspace, importing a raw file.
+    fn sheets(&mut self, ui: &mut egui::Ui) {
+        let (recordings, missing, layout, plot) =
+            (&self.recordings, &self.missing, &self.layout, &self.plot);
+        let save = self
+            .sheet
+            .show(ui, "save sheet", |ui, sheet| {
+                save_sheet(ui, sheet, &session(recordings, missing, layout, plot))
+            })
+            .flatten();
+        match save {
+            Some(SaveAction::Save(path)) => self.save_workspace(path),
+            Some(SaveAction::Cancel) => self.sheet.close(),
+            None => {}
         }
-        ui.label(
-            egui::RichText::new("corrections and calibration stay in each recording's header")
-                .small()
-                .color(weak),
-        );
-        ui.add_space(6.0);
-        if save {
-            let path = with_extension(&sheet.path);
-            self.save_workspace(path);
-        } else if close {
-            self.sheet = None;
+        let imported = self
+            .import
+            .show(ui, "import sheet", |ui, import| import.ui(ui))
+            .flatten();
+        if let Some(Outcome::Imported(dir)) = imported {
+            self.import.close();
+            self.start_load(dir, None);
         }
     }
 
@@ -1305,9 +1351,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| ui.weak(hints(self.plot.mode)));
             ui.add_space(2.0);
         });
-        if self.sheet.is_some() {
-            egui::Panel::bottom("save sheet").show(ui, |ui| self.save_sheet(ui));
-        }
+        self.sheets(ui);
         let tree = egui::Panel::left("tree")
             .resizable(false)
             .exact_size(TREE_WIDTH)

@@ -2,7 +2,7 @@
 //! pages stay resident, so a recording larger than RAM pages in as the
 //! viewport touches it.
 
-use crate::column::Dtype;
+use crate::column::{ByteOrder, Column, Dtype, Interleave};
 use memmap2::{Advice, Mmap};
 use std::fs::File;
 use std::io;
@@ -16,6 +16,7 @@ pub struct MappedColumn {
     map: Option<Mmap>,
     dtype: Dtype,
     len: usize,
+    interleave: Interleave,
 }
 
 impl MappedColumn {
@@ -47,6 +48,38 @@ impl MappedColumn {
             map,
             dtype,
             len: (bytes / size) as usize,
+            interleave: Interleave::planar(dtype),
+        })
+    }
+
+    /// Map one channel of `dtype` read in place from a file laid out as
+    /// `interleave` says: as many samples as the file holds whole frames,
+    /// bytes after the last one left out (unlike [`MappedColumn::open`], which
+    /// refuses them).
+    pub fn open_interleaved(
+        path: &Path,
+        dtype: Dtype,
+        interleave: Interleave,
+    ) -> io::Result<MappedColumn> {
+        if interleave.lane_bytes + dtype.size() > interleave.frame_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the channel does not fit in its frame",
+            ));
+        }
+        let file = File::open(path)?;
+        let (len, _) = interleave.frames(file.metadata()?.len());
+        // SAFETY: as in `open`; an imported raw file is never written either.
+        let map = if len == 0 {
+            None
+        } else {
+            Some(unsafe { Mmap::map(&file)? })
+        };
+        Ok(MappedColumn {
+            map,
+            dtype,
+            len,
+            interleave,
         })
     }
 
@@ -67,12 +100,14 @@ impl MappedColumn {
 
     /// The raw sample at `i`, widened to `f64`. No gain or offset applied.
     pub fn get(&self, i: usize) -> Option<f64> {
-        self.element(i).map(|bytes| self.dtype.decode_le(bytes))
+        self.element(i)
+            .map(|bytes| self.dtype.decode(bytes, self.interleave.byte_order))
     }
 
     /// The raw sample at `i` as an integer: exact for integer columns (time
     /// columns are `i64`), truncated for float ones.
     pub fn get_i64(&self, i: usize) -> Option<i64> {
+        debug_assert_eq!(self.interleave, Interleave::planar(self.dtype));
         self.element(i).map(|bytes| self.dtype.decode_le_i64(bytes))
     }
 
@@ -83,8 +118,29 @@ impl MappedColumn {
         out.clear();
         let range = range.start.min(self.len)..range.end.min(self.len);
         let size = self.dtype.size();
-        let bytes = &self.bytes()[range.start * size..range.end * size];
-        out.extend(bytes.chunks_exact(size).map(|b| self.dtype.decode_le(b)));
+        if self.interleave == Interleave::planar(self.dtype) {
+            let bytes = &self.bytes()[range.start * size..range.end * size];
+            out.extend(bytes.chunks_exact(size).map(|b| self.dtype.decode_le(b)));
+        } else {
+            out.extend(range.map(|i| self.get(i).expect("in range")));
+        }
+    }
+
+    /// The whole column in memory, typed as on disk.
+    pub fn to_column(&self) -> Column {
+        let order = self.interleave.byte_order;
+        let le = |i: usize| -> Vec<u8> {
+            let mut bytes = self.element(i).expect("i < len").to_vec();
+            if order == ByteOrder::Big {
+                bytes.reverse();
+            }
+            bytes
+        };
+        let mut bytes = Vec::with_capacity(self.len * self.dtype.size());
+        for i in 0..self.len {
+            bytes.extend_from_slice(&le(i));
+        }
+        Column::from_le_bytes(self.dtype, &bytes).expect("whole elements")
     }
 
     /// Tell the OS the column is about to be read front to back.
@@ -110,6 +166,13 @@ impl MappedColumn {
             return None;
         }
         let size = self.dtype.size();
-        Some(&self.bytes()[i * size..(i + 1) * size])
+        let Interleave {
+            offset_bytes,
+            frame_bytes,
+            lane_bytes,
+            ..
+        } = self.interleave;
+        let start = offset_bytes as usize + i * frame_bytes + lane_bytes;
+        Some(&self.bytes()[start..start + size])
     }
 }

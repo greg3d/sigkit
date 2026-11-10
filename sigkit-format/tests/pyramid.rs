@@ -231,6 +231,7 @@ fn a_cache_claiming_absurd_sizes_is_rejected_without_trying_to_allocate_them() {
         files: vec![(4000, 123)],
         dtype: Dtype::F32,
         base_bin_s: 0.64,
+        interleave: sigkit_format::Interleave::planar(Dtype::F32),
     };
     let good = pyramid.to_cache_bytes(&fingerprint);
     assert_eq!(
@@ -238,13 +239,14 @@ fn a_cache_claiming_absurd_sizes_is_rejected_without_trying_to_allocate_them() {
         Some(pyramid)
     );
 
-    // magic 8, file count 4, one (len, mtime) 24, dtype 1, base bin 8: the level count.
+    // magic 8, file count 4, one (len, mtime) 24, dtype 1, base bin 8,
+    // interleave 25: the level count.
     let mut levels = good.clone();
-    levels[45..49].copy_from_slice(&u32::MAX.to_le_bytes());
+    levels[70..74].copy_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(Pyramid::from_cache_bytes(&levels, &fingerprint), None);
     // Then the first level's bin count.
     let mut bins = good.clone();
-    bins[49..57].copy_from_slice(&u64::MAX.to_le_bytes());
+    bins[74..82].copy_from_slice(&u64::MAX.to_le_bytes());
     assert_eq!(Pyramid::from_cache_bytes(&bins, &fingerprint), None);
     assert_eq!(
         Pyramid::from_cache_bytes(&good[..good.len() - 1], &fingerprint),

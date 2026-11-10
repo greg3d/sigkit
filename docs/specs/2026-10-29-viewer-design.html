@@ -176,6 +176,7 @@
   <li>Dropping a file that is not a recording opens a sheet with: dtype, byte order, header offset in bytes, channel count for interleaved data, rate, gain and offset. The preview re-renders on every change.</li>
   <li>The initial dtype is guessed by decoding a prefix as each plausible dtype and scoring plausibility (finite, bounded, not dominated by outliers).</li>
   <li>Confirming writes a <code>header.json</code> beside the file as a fixed-rate stream; the data is not copied.</li>
+  <li>The stream reads the file in place through a <code>raw</code> block: <code>{ "file": "bench.dat", "offset_bytes": 512, "byte_order": "big" }</code>. Its channels are interleaved in header order, one element each per frame; bytes after the last whole frame are left out. This is the one exception to one planar little-endian column file per channel. One raw file per folder, since the header is always <code>header.json</code>.</li>
 </ul>
 
 <h3>Fixed-rate export</h3>

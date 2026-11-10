@@ -1,9 +1,11 @@
 //! `sigkit`: generate synthetic recordings with known truth, and inspect recordings.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use sigkit_format::synth::{self, FixedRateSpec, PairSpec, Signal, TimestampedSpec};
+use sigkit_format::synth::{self, FixedRateSpec, PairSpec, RawSpec, Signal, TimestampedSpec};
 use sigkit_format::wallclock::rfc3339_utc;
-use sigkit_format::{ClockDomain, Recording, SAMPLE_COUNTER_UNIT, Stream, StreamKind};
+use sigkit_format::{
+    ByteOrder, ClockDomain, Dtype, Recording, SAMPLE_COUNTER_UNIT, Stream, StreamKind,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -76,6 +78,67 @@ enum Preset {
         #[command(flatten)]
         signal: SignalArgs,
     },
+    /// A legacy raw file with no header: interleaved channels of one dtype,
+    /// for trying the viewer's import (channel j is the sine at j+1 times the
+    /// frequency; integers hold counts, 2048 per unit for i16)
+    Raw {
+        /// Output file, written as given
+        out: PathBuf,
+        #[arg(long, value_enum, default_value_t = DtypeArg::F32)]
+        dtype: DtypeArg,
+        /// Interleaved channels
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=64))]
+        channels: u16,
+        #[arg(long, value_enum, default_value_t = ByteOrderArg::Little)]
+        byte_order: ByteOrderArg,
+        /// Bytes of text before the samples, as an old acquisition program wrote
+        #[arg(long, default_value_t = 0)]
+        header_bytes: usize,
+        /// Sample rate in Hz (not written anywhere: the file has no header)
+        #[arg(long, default_value_t = 100.0)]
+        rate: f64,
+        /// Length in seconds
+        #[arg(long, default_value_t = 10.0)]
+        duration: f64,
+        #[command(flatten)]
+        signal: SignalArgs,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DtypeArg {
+    F32,
+    F64,
+    I16,
+    I32,
+    I64,
+}
+
+impl From<DtypeArg> for Dtype {
+    fn from(d: DtypeArg) -> Dtype {
+        match d {
+            DtypeArg::F32 => Dtype::F32,
+            DtypeArg::F64 => Dtype::F64,
+            DtypeArg::I16 => Dtype::I16,
+            DtypeArg::I32 => Dtype::I32,
+            DtypeArg::I64 => Dtype::I64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ByteOrderArg {
+    Little,
+    Big,
+}
+
+impl From<ByteOrderArg> for ByteOrder {
+    fn from(b: ByteOrderArg) -> ByteOrder {
+        match b {
+            ByteOrderArg::Little => ByteOrder::Little,
+            ByteOrderArg::Big => ByteOrder::Big,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -249,6 +312,35 @@ fn generate(preset: Preset) -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("recording b starts {shift} s after a");
         }
+        Preset::Raw {
+            out,
+            dtype,
+            channels,
+            byte_order,
+            header_bytes,
+            rate,
+            duration,
+            signal,
+        } => {
+            let spec = RawSpec {
+                dtype: dtype.into(),
+                byte_order: byte_order.into(),
+                channels: channels as usize,
+                header_bytes,
+                rate_hz: rate,
+                duration_s: duration,
+                signal: signal.signal(),
+                seed: signal.seed,
+            };
+            std::fs::write(&out, synth::raw(&spec).bytes)?;
+            println!(
+                "wrote {} ({} frames of {channels} {} {}-endian at {rate} Hz after {header_bytes} header bytes, no header.json)",
+                out.display(),
+                (duration * rate).round(),
+                spec.dtype,
+                spec.byte_order.name()
+            );
+        }
     }
     Ok(())
 }
@@ -310,6 +402,16 @@ fn inspect(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     n as f64 / rate
                 );
                 println!("    rate {rate:.3} Hz");
+                if let Some(raw) = &stream.raw {
+                    println!(
+                        "    read in place from raw file {} after a {}-byte header, {}-endian, {} channel{} interleaved",
+                        raw.file,
+                        raw.offset_bytes,
+                        raw.byte_order.name(),
+                        stream.channels.len(),
+                        if stream.channels.len() == 1 { "" } else { "s" }
+                    );
+                }
             }
         }
         let tc = &stream.time_correction;

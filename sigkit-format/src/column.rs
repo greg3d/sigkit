@@ -60,6 +60,94 @@ impl Dtype {
     }
 }
 
+/// Byte order of a raw file's elements. Recording columns are always little-endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ByteOrder {
+    #[default]
+    Little,
+    Big,
+}
+
+impl ByteOrder {
+    pub const ALL: [ByteOrder; 2] = [ByteOrder::Little, ByteOrder::Big];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ByteOrder::Little => "little",
+            ByteOrder::Big => "big",
+        }
+    }
+}
+
+impl Dtype {
+    /// Every dtype, integers first, narrowest first.
+    pub const ALL: [Dtype; 5] = [Dtype::I16, Dtype::I32, Dtype::I64, Dtype::F32, Dtype::F64];
+
+    /// Decode one element in `order`, widened to `f64`. `bytes` is exactly
+    /// [`Dtype::size`] long.
+    pub fn decode(self, bytes: &[u8], order: ByteOrder) -> f64 {
+        match order {
+            ByteOrder::Little => self.decode_le(bytes),
+            ByteOrder::Big => {
+                let mut le = [0u8; 8];
+                let le = &mut le[..bytes.len()];
+                le.copy_from_slice(bytes);
+                le.reverse();
+                self.decode_le(le)
+            }
+        }
+    }
+
+    /// Encode `value` as one element in `order`: rounded and saturated for
+    /// integer dtypes.
+    pub fn encode(self, value: f64, order: ByteOrder) -> Vec<u8> {
+        let mut le = match self {
+            Dtype::F32 => (value as f32).to_le_bytes().to_vec(),
+            Dtype::F64 => value.to_le_bytes().to_vec(),
+            Dtype::I16 => (value.round() as i16).to_le_bytes().to_vec(),
+            Dtype::I32 => (value.round() as i32).to_le_bytes().to_vec(),
+            Dtype::I64 => (value.round() as i64).to_le_bytes().to_vec(),
+        };
+        if order == ByteOrder::Big {
+            le.reverse();
+        }
+        le
+    }
+}
+
+/// Where one channel's elements sit in its file: the first at
+/// `offset_bytes + lane_bytes`, each next one `frame_bytes` further on. A
+/// recording's own column is planar: no offset, one element per frame,
+/// little-endian. An imported raw file interleaves its channels after a header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interleave {
+    pub offset_bytes: u64,
+    pub frame_bytes: usize,
+    pub lane_bytes: usize,
+    pub byte_order: ByteOrder,
+}
+
+impl Interleave {
+    /// A planar little-endian column of `dtype`.
+    pub fn planar(dtype: Dtype) -> Interleave {
+        Interleave {
+            offset_bytes: 0,
+            frame_bytes: dtype.size(),
+            lane_bytes: 0,
+            byte_order: ByteOrder::Little,
+        }
+    }
+
+    /// Whole frames in a file of `file_bytes`, and the bytes after the last
+    /// one. A file shorter than the offset holds no frame.
+    pub fn frames(&self, file_bytes: u64) -> (usize, u64) {
+        let body = file_bytes.saturating_sub(self.offset_bytes);
+        let frame = self.frame_bytes.max(1) as u64;
+        ((body / frame) as usize, body % frame)
+    }
+}
+
 impl std::fmt::Display for Dtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())

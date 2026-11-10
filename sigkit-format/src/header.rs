@@ -6,7 +6,7 @@
 //! `unit`, `gain` and `offset`) are normalised on rewrite: absent on read means
 //! their default, and the rewrite writes that default out.
 
-use crate::column::Dtype;
+use crate::column::{ByteOrder, Dtype, Interleave};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -114,6 +114,11 @@ pub struct Stream {
     pub time_correction: TimeCorrection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utc_anchor: Option<UtcAnchor>,
+    /// Where an imported raw file's samples are: the stream's channels are
+    /// read in place from it, interleaved. Fixed-rate streams only; `None`
+    /// for a stream with its own planar column files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawLayout>,
     pub channels: Vec<Channel>,
     #[serde(default)]
     pub notes: String,
@@ -131,6 +136,7 @@ impl Stream {
             rate_hz: None,
             time_correction: TimeCorrection::default(),
             utc_anchor: None,
+            raw: None,
             channels: Vec::new(),
             notes: String::new(),
             extra: Map::new(),
@@ -146,6 +152,7 @@ impl Stream {
             rate_hz: Some(rate_hz),
             time_correction: TimeCorrection::default(),
             utc_anchor: None,
+            raw: None,
             channels: Vec::new(),
             notes: String::new(),
             extra: Map::new(),
@@ -184,6 +191,35 @@ impl Stream {
         format!("{}.{}.bin", self.id, channel.id)
     }
 
+    /// The file a channel's samples are read from, and where in it: its own
+    /// planar column, or the imported raw file shared by the stream's
+    /// channels, each in its lane of every frame.
+    pub fn channel_column(&self, channel: &Channel) -> (String, Interleave) {
+        let Some(raw) = &self.raw else {
+            return (
+                self.channel_file_name(channel),
+                Interleave::planar(channel.dtype),
+            );
+        };
+        let mut lane_bytes = 0;
+        let mut frame_bytes = 0;
+        for other in &self.channels {
+            if other.id == channel.id {
+                lane_bytes = frame_bytes;
+            }
+            frame_bytes += other.dtype.size();
+        }
+        (
+            raw.file.clone(),
+            Interleave {
+                offset_bytes: raw.offset_bytes,
+                frame_bytes,
+                lane_bytes,
+                byte_order: raw.byte_order,
+            },
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         let invalid = |reason: String| Error::InvalidStream {
             stream: self.id.clone(),
@@ -211,6 +247,19 @@ impl Stream {
                         "fixed-rate stream needs a positive `rate_hz`".into(),
                     ));
                 }
+            }
+        }
+        if let Some(raw) = &self.raw {
+            if self.kind != StreamKind::FixedRate {
+                return Err(invalid(
+                    "only a fixed-rate stream reads a raw file in place".into(),
+                ));
+            }
+            if !is_valid_file_name(&raw.file) {
+                return Err(invalid(format!(
+                    "raw file `{}` must be a file name beside the header",
+                    raw.file
+                )));
             }
         }
         let tc = &self.time_correction;
@@ -252,6 +301,31 @@ fn is_valid_id(id: &str) -> bool {
         && !id
             .chars()
             .any(|c| matches!(c, '.' | '/' | '\\') || c.is_control())
+}
+
+/// A plain file name, in the recording's own folder: not a path, not `.` or
+/// `..`, not the header.
+fn is_valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !matches!(name, "." | ".." | crate::recording::HEADER_FILE)
+        && !name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\') || c.is_control())
+}
+
+/// An imported raw file a fixed-rate stream reads in place: its channels are
+/// interleaved, in header order, after `offset_bytes` of the file's own
+/// header. Bytes after the last whole frame are left out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawLayout {
+    /// File name, beside `header.json`.
+    pub file: String,
+    #[serde(default)]
+    pub offset_bytes: u64,
+    #[serde(default)]
+    pub byte_order: ByteOrder,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Which clock a time column counts in, and its unit: `ns`, `us`, `ms`, `s`,

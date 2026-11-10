@@ -12,16 +12,17 @@ pub mod header;
 pub mod mapped;
 pub mod pyramid;
 pub mod ratefit;
+pub mod raw;
 pub mod recording;
 pub mod residual;
 pub mod synth;
 pub mod wallclock;
 
 pub use atomic::write_atomic;
-pub use column::{Column, Dtype};
+pub use column::{ByteOrder, Column, Dtype, Interleave};
 pub use error::{Error, Result};
 pub use header::{
-    Channel, ClockDomain, Header, SAMPLE_COUNTER_UNIT, Stream, StreamKind, TIME_COLUMN,
+    Channel, ClockDomain, Header, RawLayout, SAMPLE_COUNTER_UNIT, Stream, StreamKind, TIME_COLUMN,
     TimeCorrection, UtcAnchor,
 };
 pub use mapped::MappedColumn;

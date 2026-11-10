@@ -3,9 +3,11 @@
 
 mod align;
 mod app;
+mod import;
 mod layout;
 mod motion;
 mod plot;
+mod sheet;
 mod ticks;
 mod trace;
 mod view;
@@ -21,7 +23,8 @@ use std::path::PathBuf;
     about = "Look at .sigrec recordings: min/max candles at every zoom"
 )]
 struct Cli {
-    /// .sigrec recordings to open, side by side (or drop them on the window)
+    /// .sigrec recordings to open, side by side (or drop them on the window); a
+    /// raw file with no header opens the import sheet
     recordings: Vec<PathBuf>,
     /// Time runs left to right instead of top to bottom
     #[arg(long)]

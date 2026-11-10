@@ -102,6 +102,12 @@ impl Recording {
             return Err(Error::AlreadyExists { path: header_path });
         }
         header.validate()?;
+        if let Some(stream) = header.streams.iter().find(|s| s.raw.is_some()) {
+            return Err(Error::InvalidStream {
+                stream: stream.id.clone(),
+                reason: "a raw file is imported in place, not created".into(),
+            });
+        }
         if streams.len() != header.streams.len() {
             return Err(Error::StreamCountMismatch {
                 header: header.streams.len(),
@@ -185,6 +191,9 @@ impl Recording {
             .channels
             .iter()
             .map(|channel| {
+                if stream.raw.is_some() {
+                    return Ok(self.map_column(stream_id, &channel.id)?.to_column());
+                }
                 let path = self.dir.join(stream.channel_file_name(channel));
                 let bytes = read_file(&path)?;
                 Column::from_le_bytes(channel.dtype, &bytes).ok_or_else(|| {
@@ -205,8 +214,10 @@ impl Recording {
     pub fn map_column(&self, stream_id: &str, channel_id: &str) -> Result<MappedColumn> {
         let stream = self.stream(stream_id)?;
         let channel = channel_of(stream, channel_id)?;
-        let path = self.dir.join(stream.channel_file_name(channel));
-        MappedColumn::open(&path, channel.dtype).map_err(|source| Error::Io { path, source })
+        let (file, interleave) = stream.channel_column(channel);
+        let path = self.dir.join(file);
+        MappedColumn::open_interleaved(&path, channel.dtype, interleave)
+            .map_err(|source| Error::Io { path, source })
     }
 
     /// Map a stream's time column read-only; `None` for a fixed-rate stream.
@@ -245,9 +256,8 @@ impl Recording {
         .expect("validated at open");
         let base_bin_s = BASE_BIN_INTERVALS as f64 / rate;
 
-        let mut files = vec![file_stamp(
-            &self.dir.join(stream.channel_file_name(channel)),
-        )?];
+        let (file, interleave) = stream.channel_column(channel);
+        let mut files = vec![file_stamp(&self.dir.join(file))?];
         if stream.kind == StreamKind::Timestamped {
             files.push(file_stamp(&self.dir.join(stream.time_file_name()))?);
         }
@@ -258,6 +268,7 @@ impl Recording {
             files,
             dtype: channel.dtype,
             base_bin_s,
+            interleave,
         });
         let cache_path = self
             .dir
@@ -615,6 +626,9 @@ fn validate_stream_columns(dir: &Path, stream: &Stream) -> Result<usize> {
             column_length(dir, stream, TIME_COLUMN, &file, Dtype::I64)?,
         ));
     }
+    if let Some(raw) = &stream.raw {
+        return raw_frames(dir, stream, &raw.file);
+    }
     for channel in &stream.channels {
         let file = stream.channel_file_name(channel);
         lengths.push((
@@ -623,6 +637,44 @@ fn validate_stream_columns(dir: &Path, stream: &Stream) -> Result<usize> {
         ));
     }
     same_length(stream, &lengths)
+}
+
+/// Whole frames in an imported raw file: its channels' common length. A
+/// file shorter than its header offset is an error.
+fn raw_frames(dir: &Path, stream: &Stream, file: &str) -> Result<usize> {
+    let Some(first) = stream.channels.first() else {
+        return Ok(0);
+    };
+    let (_, interleave) = stream.channel_column(first);
+    let path = dir.join(file);
+    let bytes = fs::metadata(&path)
+        .map_err(|source| missing_or_io(stream, file, &path, source))?
+        .len();
+    if bytes < interleave.offset_bytes {
+        return Err(Error::InvalidStream {
+            stream: stream.id.clone(),
+            reason: format!(
+                "raw file `{file}` holds {bytes} bytes, less than its {}-byte header offset",
+                interleave.offset_bytes
+            ),
+        });
+    }
+    Ok(interleave.frames(bytes).0)
+}
+
+fn missing_or_io(stream: &Stream, column: &str, path: &Path, source: std::io::Error) -> Error {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        Error::MissingColumn {
+            stream: stream.id.clone(),
+            column: column.to_string(),
+            path: path.to_path_buf(),
+        }
+    } else {
+        Error::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
 }
 
 /// All columns of a stream must hold the same number of samples. Returns it.
@@ -653,20 +705,8 @@ fn column_length(
 ) -> Result<usize> {
     let elem_size = dtype.size() as u64;
     let path = dir.join(file);
-    let meta = fs::metadata(&path).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            Error::MissingColumn {
-                stream: stream.id.clone(),
-                column: column.to_string(),
-                path: path.clone(),
-            }
-        } else {
-            Error::Io {
-                path: path.clone(),
-                source,
-            }
-        }
-    })?;
+    let meta =
+        fs::metadata(&path).map_err(|source| missing_or_io(stream, column, &path, source))?;
     let bytes = meta.len();
     if bytes % elem_size != 0 {
         return Err(column_size_error(stream, column, dtype, &path, bytes));
